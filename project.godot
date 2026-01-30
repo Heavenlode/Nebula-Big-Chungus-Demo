@@ -1,0 +1,44 @@
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
+
+config_version=5
+
+[Nebula]
+
+world/default_scene="uid://ck5p7purmvbqv"
+config/log_level=4
+
+[application]
+
+config/name="BigChungus"
+run/main_scene="uid://c18ded3drxmoq"
+config/features=PackedStringArray("4.6", "C#", "Mobile")
+config/icon="res://icon.svg"
+
+[autoload]
+
+Debugger="*uid://2oavajx24j8k"
+Env="*uid://bh3xc265mkd33"
+NetRunner="*uid://b0a0q7ty0fc08"
+
+[dotnet]
+
+project/assembly_name="BigChungus"
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/Nebula/plugin.cfg")
+
+[physics]
+
+3d/physics_engine="Jolt Physics"
+
+[rendering]
+
+rendering_device/driver.windows="d3d12"
+renderer/rendering_method="mobile"

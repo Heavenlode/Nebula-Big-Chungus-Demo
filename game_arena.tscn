@@ -1,0 +1,139 @@
+[gd_scene format=3 uid="uid://ck5p7purmvbqv"]
+
+[ext_resource type="Script" uid="uid://mmklhmr3xdto" path="res://GameArena.cs" id="1_oi4j7"]
+[ext_resource type="Script" uid="uid://cx63idvmd4x6n" path="res://PlayerSpawner.cs" id="2_3f1hk"]
+[ext_resource type="PackedScene" uid="uid://dxaqyp0bhxm8e" path="res://player.tscn" id="3_gusvb"]
+[ext_resource type="Shader" uid="uid://cj1rm3rgqgpp6" path="res://game_arena.gdshader" id="3_m6kjw"]
+[ext_resource type="Script" uid="uid://0fpwn46t6ywt" path="res://PelletSpawner.cs" id="4_gusvb"]
+[ext_resource type="Texture2D" uid="uid://di2uxe7dw0peh" path="res://icon.svg" id="5_gusvb"]
+[ext_resource type="Script" uid="uid://bfveh0d1424xy" path="res://GameScoreManager.cs" id="6_m08nh"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_m08nh"]
+vertex_color_use_as_albedo = true
+albedo_texture = ExtResource("5_gusvb")
+
+[sub_resource type="QuadMesh" id="QuadMesh_3f1hk"]
+material = SubResource("StandardMaterial3D_m08nh")
+orientation = 1
+
+[sub_resource type="MultiMesh" id="MultiMesh_gusvb"]
+transform_format = 1
+mesh = SubResource("QuadMesh_3f1hk")
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_ue51w"]
+size = Vector2(400, 400)
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_lm0cj"]
+render_priority = 0
+shader = ExtResource("3_m6kjw")
+shader_parameter/color_grid = Color(0.8, 0.8, 0.8, 1)
+shader_parameter/color_tile = Color(0.099985994, 0.099985994, 0.099985994, 1)
+shader_parameter/small_grid_size = 60.0000028025
+shader_parameter/large_grid_size = 10.0000004275
+shader_parameter/line_thickness = 0.02
+shader_parameter/fade_start_distance = 25.0000011875
+shader_parameter/fade_end_distance = 30.000001425
+
+[node name="GameArena" type="Node3D" unique_id=142545431]
+script = ExtResource("1_oi4j7")
+
+[node name="PlayerSpawner" type="Node" parent="." unique_id=1684051389 node_paths=PackedStringArray("StartScrenn", "ScoreContainer")]
+script = ExtResource("2_3f1hk")
+CharacterScene = ExtResource("3_gusvb")
+StartScrenn = NodePath("../UI/StartScreen")
+ScoreContainer = NodePath("../UI/ScoreContainer")
+
+[node name="PelletSpawner" type="Node" parent="." unique_id=1321025797 node_paths=PackedStringArray("PelletMeshInstance")]
+script = ExtResource("4_gusvb")
+PelletMeshInstance = NodePath("PelletVisual")
+
+[node name="PelletVisual" type="MultiMeshInstance3D" parent="PelletSpawner" unique_id=958039707]
+multimesh = SubResource("MultiMesh_gusvb")
+
+[node name="GameScoreManager" type="Node" parent="." unique_id=1148927333 node_paths=PackedStringArray("PelletSpawner")]
+script = ExtResource("6_m08nh")
+PelletSpawner = NodePath("../PelletSpawner")
+
+[node name="ArenaFloor" type="MeshInstance3D" parent="." unique_id=827506720]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.009410858, -0.019726753, -0.008527756)
+mesh = SubResource("PlaneMesh_ue51w")
+surface_material_override/0 = SubResource("ShaderMaterial_lm0cj")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1311861185]
+transform = Transform3D(1, 0, 0, 0, 0.7071067, 0.7071067, 0, -0.7071067, 0.7071067, 0, 0, 147.79147)
+shadow_enabled = true
+
+[node name="UI" type="CanvasLayer" parent="." unique_id=2140665389]
+
+[node name="StartScreen" type="Panel" parent="UI" unique_id=1672914195]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="PanelContainer" type="VBoxContainer" parent="UI/StartScreen" unique_id=387334989]
+custom_minimum_size = Vector2(150, 200)
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -75.0
+offset_top = -100.0
+offset_right = 75.0
+offset_bottom = 100.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Label" type="Label" parent="UI/StartScreen/PanelContainer" unique_id=644317100]
+layout_mode = 2
+text = "BIG CHUNGUS ONLINE"
+
+[node name="FinalScoreLabel" type="Label" parent="UI/StartScreen/PanelContainer" unique_id=1822042290]
+unique_name_in_owner = true
+layout_mode = 2
+horizontal_alignment = 1
+
+[node name="Control2" type="Control" parent="UI/StartScreen/PanelContainer" unique_id=1850339424]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="PlayButton" type="Button" parent="UI/StartScreen/PanelContainer" unique_id=780895066]
+layout_mode = 2
+size_flags_vertical = 4
+text = "Play!"
+
+[node name="Control" type="Control" parent="UI/StartScreen/PanelContainer" unique_id=234293856]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="ExitButton" type="Button" parent="UI/StartScreen/PanelContainer" unique_id=1056472223]
+layout_mode = 2
+size_flags_vertical = 4
+text = "Exit"
+
+[node name="ScoreContainer" type="MarginContainer" parent="UI" unique_id=1598126058]
+visible = false
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+theme_override_constants/margin_left = 16
+theme_override_constants/margin_top = 16
+theme_override_constants/margin_right = 16
+theme_override_constants/margin_bottom = 16
+
+[node name="ScoreLabel" type="Label" parent="UI/ScoreContainer" unique_id=975603635]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 8
+size_flags_vertical = 8
+theme_override_font_sizes/font_size = 32
+text = "Score: 0"
+
+[connection signal="pressed" from="UI/StartScreen/PanelContainer/PlayButton" to="PlayerSpawner" method="_OnPlay"]
+[connection signal="pressed" from="UI/StartScreen/PanelContainer/ExitButton" to="PlayerSpawner" method="_OnExit"]
