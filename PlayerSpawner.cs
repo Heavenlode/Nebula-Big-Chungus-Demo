@@ -8,12 +8,10 @@ public partial class PlayerSpawner : NetNode
     public PackedScene CharacterScene;
 
     [Export]
-    public Control StartScrenn;
+    public Control StartScreen;
     
     [Export]
     public Control ScoreContainer;
-
-    private int playerCount = 0;
 
     public Dictionary<UUID, Player> PlayerCharacters { get; } = new();
 
@@ -36,13 +34,13 @@ public partial class PlayerSpawner : NetNode
 
     public void OnPlayerDespawn()
     {
-        StartScrenn.Visible = true;
+        StartScreen.Visible = true;
         ScoreContainer.Visible = false;
     }
 
     public void _OnPlay()
     {
-        StartScrenn.Visible = false;
+        StartScreen.Visible = false;
         ScoreContainer.Visible = true;
         JoinGame();
     }

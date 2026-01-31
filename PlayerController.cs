@@ -20,16 +20,16 @@ public partial class PlayerController : NetNode3D
     [Export]
     public float ScoreSlowdownFactor { get; set; } = 0.05f;
 
+    [Export]
+    private Player _player;
+
     [NetProperty]
     public Vector3 Direction { get; set; } = new Vector3(1, 0, 0);
-
-    private Player _player;
 
     public override void _WorldReady()
     {
         base._WorldReady();
         Network.InitializeInput<PlayerInput>();
-        _player = GetParent<Player>();
     }
 
     public override void _PhysicsProcess(double delta)

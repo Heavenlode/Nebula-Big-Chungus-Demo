@@ -2,12 +2,12 @@ shader_type spatial;
 render_mode specular_disabled;
 
 uniform vec3 color_grid : source_color = vec3(0.8, 0.8, 0.8);
-uniform vec3 color_tile : source_color = vec3(0.0, 0.0, 0.5);
-uniform float small_grid_size : hint_range(1.0, 1000.0) = 120.0;
-uniform float large_grid_size : hint_range(1.0, 200.0) = 20.0;
+uniform vec3 color_tile : source_color = vec3(0.102, 0.102, 0.102);
+uniform float small_grid_size : hint_range(1.0, 1000.0) = 60.0;
+uniform float large_grid_size : hint_range(1.0, 200.0) = 10.0;
 uniform float line_thickness : hint_range(0.001, 0.1) = 0.02;
-uniform float fade_start_distance : hint_range(0.0, 200.0) = 6.0;
-uniform float fade_end_distance : hint_range(0.0, 500.0) = 20.0;
+uniform float fade_start_distance : hint_range(0.0, 200.0) = 25.0;
+uniform float fade_end_distance : hint_range(0.0, 500.0) = 30.0;
 
 float grid_line(vec2 uv, float grid_size, float thickness) {
 	vec2 grid_uv = uv * grid_size;

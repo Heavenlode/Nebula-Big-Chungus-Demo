@@ -103,6 +103,7 @@ public partial class GameScoreManager : NetNode
             foreach (var player in playersToDespawn)
             {
                 player.Network.Despawn();
+                Players.Remove(player);
             }
         }
     }

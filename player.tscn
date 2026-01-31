@@ -20,9 +20,10 @@ _model = NodePath("Model")
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5, 0)
 mesh = SubResource("BoxMesh_sh265")
 
-[node name="Controller" type="Node3D" parent="." unique_id=1237251344]
+[node name="Controller" type="Node3D" parent="." unique_id=1237251344 node_paths=PackedStringArray("_player")]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5, 0)
 script = ExtResource("2_onrkg")
+_player = NodePath("..")
 
 [node name="NetTransform3D" type="Node3D" parent="." unique_id=2048790745 node_paths=PackedStringArray("SourceNode", "TargetNode")]
 script = ExtResource("3_i3pqv")

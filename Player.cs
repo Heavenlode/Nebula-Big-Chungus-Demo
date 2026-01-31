@@ -7,11 +7,6 @@ public partial class Player : NetNode
     public ulong ColorSeed { get; set; } = 0;
     protected virtual void OnNetChangeColorSeed(int tick, ulong oldValue, ulong newValue)
     {
-        UpdateModelColor();
-    }
-
-    private void UpdateModelColor()
-    {
         var random = new RandomNumberGenerator();
         random.Seed = ColorSeed;
         _model.GetActiveMaterial(0).Set("albedo_color", new Color(
@@ -83,17 +78,6 @@ public partial class Player : NetNode
             var FinalScoreLabel = Network.CurrentWorld.RootScene.RawNode.GetNode<Label>("%FinalScoreLabel");
             FinalScoreLabel?.Text = $"Final Score: {Score}";
 
-        }
-    }
-
-    public override void _ExitTree()
-    {
-        base._ExitTree();
-
-        if (Network.IsServer)
-        {
-            var scoreManager = Network.CurrentWorld?.RootScene?.RawNode?.GetNode<GameScoreManager>("GameScoreManager");
-            scoreManager?.Players.Remove(this);
         }
     }
 
