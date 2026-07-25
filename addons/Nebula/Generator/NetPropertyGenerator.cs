@@ -41,32 +41,6 @@ public class NetPropertyGenerator : IIncrementalGenerator
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
-    // Maps C# types to their PropertyCache field names
-    private static readonly Dictionary<string, string> TypeToPropertyCacheField = new()
-    {
-        { "bool", "BoolValue" },
-        { "System.Boolean", "BoolValue" },
-        { "byte", "ByteValue" },
-        { "System.Byte", "ByteValue" },
-        { "int", "IntValue" },
-        { "System.Int32", "IntValue" },
-        { "long", "LongValue" },
-        { "System.Int64", "LongValue" },
-        { "ulong", "LongValue" },
-        { "System.UInt64", "LongValue" },
-        { "float", "FloatValue" },
-        { "System.Single", "FloatValue" },
-        { "double", "DoubleValue" },
-        { "System.Double", "DoubleValue" },
-        { "Godot.Vector2", "Vec2Value" },
-        { "Vector2", "Vec2Value" },
-        { "Godot.Vector3", "Vec3Value" },
-        { "Vector3", "Vec3Value" },
-        { "Godot.Quaternion", "QuatValue" },
-        { "Quaternion", "QuatValue" },
-        { "string", "StringValue" },
-        { "System.String", "StringValue" },
-    };
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
@@ -121,16 +95,18 @@ public class NetPropertyGenerator : IIncrementalGenerator
 
         // Check if the property type implements IBsonValue<T> or IBsonSerializable<T>
         bool isBsonSerializable = false;
-        bool implementsINetPropertyBindable = false;
+        bool implementsINetSerializable = false;
         if (propertySymbol.Type is INamedTypeSymbol namedType)
         {
             isBsonSerializable = namedType.AllInterfaces.Any(i =>
                 i.IsGenericType && (i.OriginalDefinition.Name == "IBsonValue" ||
                                     i.OriginalDefinition.Name == "IBsonSerializable"));
-            
-            // Check if the type implements INetPropertyBindable
-            implementsINetPropertyBindable = namedType.AllInterfaces.Any(i =>
-                i.Name == "INetPropertyBindable");
+
+            // Serializable object types (NetArray, CargoState, ...) are mutated in place, so the
+            // property setter never fires -- their reference must be seeded into the cache at init
+            // (see InitializeNetPropertyBindings) or the every-tick object serializer ships empty.
+            implementsINetSerializable = namedType.AllInterfaces.Any(i =>
+                i.IsGenericType && i.OriginalDefinition.Name == "INetSerializable");
         }
 
         // Simple name for internal lookups (PropertyCache field mapping)
@@ -192,7 +168,7 @@ public class NetPropertyGenerator : IIncrementalGenerator
             propertyLocation,
             predicted,
             hasToleranceProperty,
-            implementsINetPropertyBindable);
+            implementsINetSerializable);
     }
 
     /// <summary>
@@ -233,22 +209,7 @@ public class NetPropertyGenerator : IIncrementalGenerator
 
     private static string GetPropertyCacheFieldName(string propertyType)
     {
-        // Check direct mapping
-        if (TypeToPropertyCacheField.TryGetValue(propertyType, out var fieldName))
-        {
-            return fieldName;
-        }
-
-        // For custom value types (INetValue<T>), use {TypeName}Value
-        // Extract the simple type name from fully qualified name
-        var simpleName = propertyType.Split('.').Last();
-        if (simpleName.EndsWith("?"))
-        {
-            simpleName = simpleName.TrimEnd('?');
-        }
-
-        // Reference types use RefValue
-        return $"{simpleName}Value";
+        return GeneratorUtils.GetPropertyCacheFieldName(propertyType);
     }
 
     /// <summary>
@@ -257,28 +218,7 @@ public class NetPropertyGenerator : IIncrementalGenerator
     /// </summary>
     private static string GetCacheReadExpression(PropertyInfo prop, string cacheVar)
     {
-        var cacheField = GetPropertyCacheFieldName(prop.PropertyType);
-
-        if (prop.IsEnum)
-        {
-            // Enums are stored as IntValue, need to cast
-            return $"({prop.PropertyType}){cacheVar}.IntValue";
-        }
-        else if (prop.PropertyType is "ulong" or "System.UInt64")
-        {
-            // ulong is stored in LongValue but needs explicit cast
-            return $"(ulong){cacheVar}.LongValue";
-        }
-        else if (!prop.IsValueType && cacheField != "StringValue")
-        {
-            // Reference types (except string) use RefValue with cast
-            return $"({prop.PropertyType}){cacheVar}.RefValue!";
-        }
-        else
-        {
-            // Direct field access for known types
-            return $"{cacheVar}.{cacheField}";
-        }
+        return GeneratorUtils.GetCacheReadExpression(prop.PropertyType, prop.IsEnum, prop.IsValueType, cacheVar);
     }
 
     /// <summary>
@@ -434,7 +374,13 @@ public class NetPropertyGenerator : IIncrementalGenerator
         {
             "Vector3" => $"({predictedVar} - {confirmedVar}).LengthSquared() <= {toleranceVar} * {toleranceVar}",
             "Vector2" => $"({predictedVar} - {confirmedVar}).LengthSquared() <= {toleranceVar} * {toleranceVar}",
-            "Quaternion" => $"Godot.Mathf.Abs({predictedVar}.Dot({confirmedVar})) >= 1.0f - {toleranceVar}",
+            // Angle-based (radians): callers author tolerances like 0.1 meaning ~5.7°. The previous
+            // dot-based form (|dot| >= 1 - tolerance) silently tolerated 2*acos(1 - tolerance) of
+            // divergence — 51.7° at tolerance 0.1 — letting rotation state drift far apart without
+            // reconciliation while everything derived from it (movement bases) split client/server.
+            // AngleTo is hemisphere-safe, and NaN/zero quaternions compare false → treated as
+            // mispredicted → restored, which is the safe direction.
+            "Quaternion" => $"{predictedVar}.AngleTo({confirmedVar}) <= {toleranceVar}",
             "float" or "System.Single" => $"Godot.Mathf.Abs({predictedVar} - {confirmedVar}) <= {toleranceVar}",
             "double" or "System.Double" => $"System.Math.Abs({predictedVar} - {confirmedVar}) <= {toleranceVar}",
             "int" or "System.Int32" or "long" or "System.Int64" or "byte" or "System.Byte" => $"{predictedVar} == {confirmedVar}",
@@ -561,53 +507,47 @@ public class NetPropertyGenerator : IIncrementalGenerator
             sb.AppendLine($"partial class {className}");
             sb.AppendLine("{");
 
-            // Generate On{PropertyName}Changed methods (existing functionality)
+            // Generate On{PropertyName}Changed methods
             for (int i = 0; i < propList.Count; i++)
             {
                 var prop = propList[i]!;
                 var markDirtyMethod = prop.IsValueType ? "MarkDirty" : "MarkDirtyRef";
-                var globalPropIndex = baseOffset + i;
 
                 sb.AppendLine($"    public void On{prop.PropertyName}Changed({prop.FullyQualifiedPropertyType} oldVal, {prop.FullyQualifiedPropertyType} newVal)");
                 sb.AppendLine("    {");
+                sb.AppendLine("        if (Engine.IsEditorHint()) return;");
                 sb.AppendLine($"        Network.{markDirtyMethod}(this, \"{prop.PropertyName}\", newVal);");
-                
-                // If the property type implements INetPropertyBindable, bind the callback
-                // This allows types like NetArray to notify when internal state changes
-                if (prop.ImplementsINetPropertyBindable)
-                {
-                    sb.AppendLine($"        (newVal as Nebula.Serialization.INetPropertyBindable)?.BindToNetProperty(() => Network.MarkDirtyByIndex({globalPropIndex}));");
-                }
-                
                 sb.AppendLine("    }");
                 sb.AppendLine();
             }
 
-            // Generate InitializeNetPropertyBindings for INetPropertyBindable properties
-            // This is called from _NetworkPrepare to bind callbacks for properties initialized inline
-            var bindableProps = propList.Where(p => p!.ImplementsINetPropertyBindable).ToList();
-            if (bindableProps.Count > 0)
+            // Seed the property cache for INetSerializable object properties initialized inline.
+            // Called from _NetworkPrepare. Automatic (based on the type implementing INetSerializable),
+            // so a mutable object NetProperty can no longer silently "replicate empty" by forgetting a marker.
+            var serializableObjectProps = propList.Where(p => p!.ImplementsINetSerializable).ToList();
+            if (serializableObjectProps.Count > 0)
             {
                 sb.AppendLine("    /// <summary>");
-                sb.AppendLine("    /// Initializes network property bindings for INetPropertyBindable properties.");
-                sb.AppendLine("    /// Called from _NetworkPrepare to bind callbacks for properties initialized inline.");
+                sb.AppendLine("    /// Seeds the network property cache for INetSerializable object properties initialized inline.");
+                sb.AppendLine("    /// Inline initialization bypasses the property setter, so without this the every-tick");
+                sb.AppendLine("    /// object serializer would read a null cache and ship empty. Called from _NetworkPrepare.");
                 sb.AppendLine("    /// </summary>");
                 sb.AppendLine("    internal override void InitializeNetPropertyBindings()");
                 sb.AppendLine("    {");
                 sb.AppendLine("        base.InitializeNetPropertyBindings();");
-                
+                sb.AppendLine("        if (Engine.IsEditorHint()) return;");
+
                 for (int i = 0; i < propList.Count; i++)
                 {
                     var prop = propList[i]!;
-                    if (!prop.ImplementsINetPropertyBindable) continue;
-                    
-                    var globalPropIndex = baseOffset + i;
-                    // Bind mutation callback for future changes
-                    sb.AppendLine($"        ({prop.PropertyName} as Nebula.Serialization.INetPropertyBindable)?.BindToNetProperty(() => Network.MarkDirtyByIndex({globalPropIndex}));");
-                    // Also cache the initial value so serializer can find it (inline initialization bypasses property setter)
+                    if (!prop.ImplementsINetSerializable) continue;
+
+                    // Cache the initial reference so the serializer can find it. There is deliberately
+                    // no per-mutation callback: object properties self-filter every tick (their per-peer
+                    // sync state lives in the serializer).
                     sb.AppendLine($"        if ({prop.PropertyName} != null) Network.MarkDirtyRef(this, \"{prop.PropertyName}\", {prop.PropertyName});");
                 }
-                
+
                 sb.AppendLine("    }");
                 sb.AppendLine();
             }
@@ -1062,6 +1002,13 @@ public class NetPropertyGenerator : IIncrementalGenerator
                 sb.AppendLine("        int slot = tick & (PREDICTION_BUFFER_SIZE - 1);");
                 sb.AppendLine("        bool anyMispredicted = false;");
                 sb.AppendLine();
+                // Emit per-property misprediction flags
+                foreach (var prop in predictedProps)
+                {
+                    sb.AppendLine($"        bool _miss_{prop!.PropertyName} = false;");
+                }
+                sb.AppendLine();
+                sb.AppendLine("        // Phase 1: Detect per-property misprediction");
                 foreach (var prop in predictedProps)
                 {
                     var compareExpr = GetPredictionCompareExpression(prop!, "predicted", "confirmed", "tolerance");
@@ -1072,13 +1019,24 @@ public class NetPropertyGenerator : IIncrementalGenerator
                     sb.AppendLine($"            var confirmed = _confirmed_{prop.PropertyName};");
                     sb.AppendLine($"            if (!({compareExpr}))");
                     sb.AppendLine("            {");
-                    sb.AppendLine($"                {prop.PropertyName} = confirmed;");
+                    sb.AppendLine($"                _miss_{prop.PropertyName} = true;");
                     sb.AppendLine("                anyMispredicted = true;");
                     sb.AppendLine("            }");
                     sb.AppendLine("        }");
                 }
                 sb.AppendLine();
-                sb.AppendLine("        if (anyMispredicted) OnConfirmedStateRestored();");
+                sb.AppendLine("        // Phase 2: If any misprediction, restore all properties to incomingTick state.");
+                sb.AppendLine("        // Mispredicted properties get the confirmed (server) value.");
+                sb.AppendLine("        // Non-mispredicted properties get their predicted value,");
+                sb.AppendLine("        // maintaining temporal consistency while preserving correct client predictions.");
+                sb.AppendLine("        if (anyMispredicted)");
+                sb.AppendLine("        {");
+                foreach (var prop in predictedProps)
+                {
+                    sb.AppendLine($"            {prop!.PropertyName} = _miss_{prop.PropertyName} ? _confirmed_{prop.PropertyName} : _predicted_{prop.PropertyName}[slot];");
+                }
+                sb.AppendLine("            OnConfirmedStateRestored();");
+                sb.AppendLine("        }");
                 sb.AppendLine("        return anyMispredicted;");
                 sb.AppendLine("    }");
                 sb.AppendLine();
@@ -1147,6 +1105,6 @@ public class NetPropertyGenerator : IIncrementalGenerator
         // Prediction fields
         bool Predicted,
         bool HasToleranceProperty,
-        // INetPropertyBindable support
-        bool ImplementsINetPropertyBindable);
+        // True for INetSerializable object properties (need their ref seeded into the cache at init)
+        bool ImplementsINetSerializable);
 }

@@ -9,7 +9,7 @@ namespace Nebula.Utility.Tools
     public partial class Env : Node
     {
         public static Env Instance { get; private set; }
-        private bool initialized = false;
+        private string initializedFilename = null;
         private Dictionary<string, string> env = new Dictionary<string, string>();
 
         public Dictionary<string, string> StartArgs = [];
@@ -40,7 +40,7 @@ namespace Nebula.Utility.Tools
         }
 
         public static Dictionary<ProjectSettingId, string> ProjectSettingKeys = new Dictionary<ProjectSettingId, string> {
-            { ProjectSettingId.WORLD_DEFAULT_SCENE, "Nebula/world/default_scene" }
+            { ProjectSettingId.WORLD_DEFAULT_SCENE, "Nebula/config/default_scene" }
         };
 
         public override void _Ready()
@@ -60,7 +60,23 @@ namespace Nebula.Utility.Tools
                 }
             }
 
-            InitialWorldScene = StartArgs.GetValueOrDefault("initialWorldScene", ProjectSettings.GetSetting(ProjectSettingKeys[ProjectSettingId.WORLD_DEFAULT_SCENE]).AsString());
+            // Priority: cmdline --initialWorldScene → .env INITIAL_WORLD_SCENE → project default.
+            if (StartArgs.TryGetValue("initialWorldScene", out var argScene) && !string.IsNullOrEmpty(argScene))
+            {
+                InitialWorldScene = argScene;
+            }
+            else
+            {
+                var fromEnv = GetValue("INITIAL_WORLD_SCENE");
+                if (!string.IsNullOrEmpty(fromEnv))
+                {
+                    InitialWorldScene = fromEnv;
+                }
+                else
+                {
+                    InitialWorldScene = ProjectSettings.GetSetting(ProjectSettingKeys[ProjectSettingId.WORLD_DEFAULT_SCENE]).AsString();
+                }
+            }
 
             // Check for worldId with case-insensitive key lookup
             var worldIdKey = StartArgs.Keys.FirstOrDefault(k => k.Equals("worldId", StringComparison.OrdinalIgnoreCase));
@@ -127,11 +143,17 @@ namespace Nebula.Utility.Tools
 
         private Dictionary<string, string> Parse(string filename)
         {
-            if (initialized) return env;
+            if (initializedFilename == filename) return env;
 
             if (!FileAccess.FileExists(filename))
             {
                 return new Dictionary<string, string>();
+            }
+
+            // Clear any previously cached env if switching files
+            if (initializedFilename != null)
+            {
+                env.Clear();
             }
 
             var file = FileAccess.Open(filename, FileAccess.ModeFlags.Read);
@@ -146,7 +168,7 @@ namespace Nebula.Utility.Tools
                 }
             }
 
-            initialized = true;
+            initializedFilename = filename;
             return env;
         }
     }

@@ -31,6 +31,9 @@ namespace Nebula.Generators
             sb.AppendLine("    public static class GeneratedProtocol");
             sb.AppendLine("    {");
 
+            // Protocol identity hash (must be first so it's easy to eyeball in the generated file)
+            EmitProtocolHash(sb, data);
+
             // Static methods (serializable types)
             EmitStaticMethods(sb, data);
             
@@ -64,6 +67,144 @@ namespace Nebula.Generators
             sb.AppendLine("}");
 
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Emits a deterministic 64-bit FNV-1a hash of the entire protocol: the Nebula
+        /// version, scene ids and paths, static node paths, every property (order, type,
+        /// flags), every function signature, and all serializable types. Two builds produce
+        /// the same hash iff they run the same Nebula version over an identical protocol,
+        /// so it serves as a connection handshake token.
+        ///
+        /// The Nebula version stands in for the runtime wire format: changes to serializer
+        /// encoding, packet framing, or handshake shape aren't visible in the protocol data
+        /// above, and folding the version in means any release that alters them
+        /// automatically stops old and new builds from talking. The cost is that a release
+        /// which changes nothing on the wire also invalidates compatibility - deliberate,
+        /// since a false "compatible" is far worse than a false "incompatible".
+        /// </summary>
+        private static void EmitProtocolHash(StringBuilder sb, ProtocolData data)
+        {
+            const ulong FnvOffset = 14695981039346656037UL;
+            const ulong FnvPrime = 1099511628211UL;
+            ulong hash = FnvOffset;
+
+            void Mix(string s)
+            {
+                if (s == null) s = "";
+                for (int i = 0; i < s.Length; i++)
+                {
+                    hash ^= s[i];
+                    hash *= FnvPrime;
+                }
+                hash ^= 0x1F; // Unit separator between fields
+                hash *= FnvPrime;
+            }
+
+            Mix("NEBULA_PROTOCOL");
+            Mix(data.NebulaVersion);
+
+            // Scenes, in id order (dictionaries are sorted explicitly for determinism)
+            var sceneIds = new List<byte>(data.ScenesMap.Keys);
+            sceneIds.Sort();
+            foreach (var sceneId in sceneIds)
+            {
+                var scenePath = data.ScenesMap[sceneId];
+                Mix("scene");
+                Mix(sceneId.ToString(CultureInfo.InvariantCulture));
+                Mix(scenePath);
+
+                if (data.SceneInterestMap.TryGetValue(scenePath, out var interest))
+                {
+                    Mix(interest.InterestAny.ToString(CultureInfo.InvariantCulture));
+                    Mix(interest.InterestRequired.ToString(CultureInfo.InvariantCulture));
+                }
+
+                if (data.StaticNetworkNodePathsMap.TryGetValue(scenePath, out var nodeMap))
+                {
+                    var nodeIds = new List<byte>(nodeMap.Keys);
+                    nodeIds.Sort();
+                    foreach (var nodeId in nodeIds)
+                    {
+                        Mix("node");
+                        Mix(nodeId.ToString(CultureInfo.InvariantCulture));
+                        Mix(nodeMap[nodeId]);
+                    }
+                }
+
+                if (data.PropertiesLookup.TryGetValue(scenePath, out var props))
+                {
+                    var propIndices = new List<int>(props.Keys);
+                    propIndices.Sort();
+                    foreach (var propIndex in propIndices)
+                    {
+                        var prop = props[propIndex];
+                        Mix("prop");
+                        Mix(prop.Index.ToString(CultureInfo.InvariantCulture));
+                        Mix(prop.LocalIndex.ToString(CultureInfo.InvariantCulture));
+                        Mix(prop.NodePath);
+                        Mix(prop.Name);
+                        Mix(prop.TypeFullName);
+                        Mix(prop.SubtypeIdentifier ?? "");
+                        Mix(prop.ClassIndex.ToString(CultureInfo.InvariantCulture));
+                        Mix(prop.InterestMask.ToString(CultureInfo.InvariantCulture));
+                        Mix(prop.InterestRequired.ToString(CultureInfo.InvariantCulture));
+                        Mix(prop.IsObjectProperty ? "1" : "0");
+                        Mix(prop.IsPerPeer ? "1" : "0");
+                        Mix(prop.IsEnum ? "1" : "0");
+                        Mix(prop.ChunkBudget.ToString(CultureInfo.InvariantCulture));
+                    }
+                }
+
+                if (data.FunctionsLookup.TryGetValue(scenePath, out var funcs))
+                {
+                    var funcIndices = new List<int>(funcs.Keys);
+                    funcIndices.Sort();
+                    foreach (var funcIndex in funcIndices)
+                    {
+                        var func = funcs[funcIndex];
+                        Mix("func");
+                        Mix(func.Index.ToString(CultureInfo.InvariantCulture));
+                        Mix(func.NodePath);
+                        Mix(func.Name);
+                        Mix(func.Sources.ToString(CultureInfo.InvariantCulture));
+                        foreach (var arg in func.Arguments)
+                        {
+                            Mix("arg");
+                            Mix(arg.TypeFullName);
+                            Mix(arg.SubtypeIdentifier ?? "");
+                            Mix(arg.EnumUnderlyingTypeName ?? "");
+                        }
+                    }
+                }
+            }
+
+            // Serializable types, in class-index order
+            var methodIndices = new List<int>(data.StaticMethods.Keys);
+            methodIndices.Sort();
+            foreach (var classIndex in methodIndices)
+            {
+                var method = data.StaticMethods[classIndex];
+                Mix("type");
+                Mix(classIndex.ToString(CultureInfo.InvariantCulture));
+                Mix(method.TypeFullName);
+                Mix(method.MethodType.ToString(CultureInfo.InvariantCulture));
+                Mix(method.IsValueType ? "1" : "0");
+            }
+
+            sb.AppendLine("        /// <summary>");
+            sb.AppendLine("        /// The Nebula version this protocol was generated against, from addons/Nebula/plugin.cfg.");
+            sb.AppendLine("        /// Folded into ProtocolHash, so builds on different Nebula versions never interoperate.");
+            sb.AppendLine("        /// </summary>");
+            sb.AppendLine($"        public const string NebulaVersion = \"{data.NebulaVersion}\";");
+            sb.AppendLine();
+            sb.AppendLine("        /// <summary>");
+            sb.AppendLine("        /// Deterministic hash of the entire protocol (Nebula version, scenes, properties,");
+            sb.AppendLine("        /// functions, serializable types). Used as a connection handshake");
+            sb.AppendLine("        /// token: clients whose hash differs from the server's are rejected.");
+            sb.AppendLine("        /// </summary>");
+            sb.AppendLine($"        public const ulong ProtocolHash = 0x{hash.ToString("X16", CultureInfo.InvariantCulture)}UL;");
+            sb.AppendLine();
         }
 
         private static void EmitStaticMethods(StringBuilder sb, ProtocolData data)
@@ -408,7 +549,17 @@ namespace Nebula.Generators
             
             foreach (var arg in args)
             {
-                var variantType = MapTypeToVariant(arg.TypeFullName, out var subtype);
+                string variantType;
+                string? subtype = null;
+                if (arg.IsEnum)
+                {
+                    variantType = "Int";
+                    subtype = "Enum";
+                }
+                else
+                {
+                    variantType = MapTypeToVariant(arg.TypeFullName, out subtype);
+                }
                 var actualSubtype = arg.SubtypeIdentifier ?? subtype ?? "None";
                 sb.AppendLine($"{indent}    new NetFunctionArgument(SerialVariantType.{variantType}, new SerialMetadata(\"{Escape(actualSubtype)}\")),");
             }
@@ -487,8 +638,8 @@ namespace Nebula.Generators
             sb.AppendLine("        /// <summary>Delegate for reflection-free network serialization. Returns true if data was written.</summary>");
             sb.AppendLine("        public delegate bool NetworkSerializeFunc(WorldRunner world, NetPeer peer, ref PropertyCache cache, NetBuffer buffer, int maxBytes);");
             sb.AppendLine();
-            sb.AppendLine("        /// <summary>Delegate for peer acknowledgment callback on INetSerializable types.</summary>");
-            sb.AppendLine("        public delegate void OnPeerAcknowledgeFunc(object obj, UUID peerId);");
+            sb.AppendLine("        /// <summary>Delegate for peer acknowledgment callback on INetSerializable types. Tick is the acknowledged tick.</summary>");
+            sb.AppendLine("        public delegate void OnPeerAcknowledgeFunc(object obj, UUID peerId, Tick tick);");
             sb.AppendLine();
             sb.AppendLine("        /// <summary>Delegate for peer disconnect callback on INetSerializable types.</summary>");
             sb.AppendLine("        public delegate void OnPeerDisconnectedFunc(object obj, UUID peerId);");
@@ -502,9 +653,6 @@ namespace Nebula.Generators
         /// </summary>
         private static void EmitDeserializersDictionary(StringBuilder sb, ProtocolData data)
         {
-            // Collect concrete generic types (same as serializers)
-            var concreteGenerics = CollectConcreteGenericTypes(data);
-            
             sb.AppendLine("        public static readonly FrozenDictionary<int, NetworkDeserializeFunc> Deserializers =");
             sb.AppendLine("            new Dictionary<int, NetworkDeserializeFunc>");
             sb.AppendLine("            {");
@@ -533,19 +681,6 @@ namespace Nebula.Generators
                 }
             }
             
-            // Add concrete generic types (e.g., NetArray<Vector3>)
-            foreach (var (classIndex, concreteType, isValueType) in concreteGenerics)
-            {
-                if (isValueType)
-                {
-                    sb.AppendLine($"                [{classIndex}] = (world, peer, buffer, existing) => {concreteType}.NetworkDeserialize(world, peer, buffer),");
-                }
-                else
-                {
-                    sb.AppendLine($"                [{classIndex}] = (world, peer, buffer, existing) => {concreteType}.NetworkDeserialize(world, peer, buffer, existing as {concreteType}),");
-                }
-            }
-            
             sb.AppendLine("            }.ToFrozenDictionary();");
             sb.AppendLine();
         }
@@ -556,10 +691,6 @@ namespace Nebula.Generators
         /// </summary>
         private static void EmitSerializersDictionary(StringBuilder sb, ProtocolData data)
         {
-            // Collect concrete generic types from properties
-            // These need serializers generated even though their open generic definitions are skipped
-            var concreteGenerics = CollectConcreteGenericTypes(data);
-            
             // First, emit all the static serializer methods
             sb.AppendLine("        #region Serializer Methods");
             sb.AppendLine();
@@ -597,28 +728,6 @@ namespace Nebula.Generators
                 sb.AppendLine();
             }
             
-            // Emit serializers for concrete generic types (e.g., NetArray<Vector3>)
-            foreach (var (classIndex, concreteType, isValueType) in concreteGenerics)
-            {
-                var methodName = $"Serializer_{classIndex}";
-                
-                if (isValueType)
-                {
-                    var shortName = GetShortTypeName(concreteType);
-                    sb.AppendLine($"        private static bool {methodName}(WorldRunner world, NetPeer peer, ref PropertyCache cache, NetBuffer buffer, int maxBytes)");
-                    sb.AppendLine("        {");
-                    sb.AppendLine($"            {concreteType}.NetworkSerialize(world, peer, in cache.{shortName}Value, buffer);");
-                    sb.AppendLine("            return true;");
-                    sb.AppendLine("        }");
-                }
-                else
-                {
-                    sb.AppendLine($"        private static bool {methodName}(WorldRunner world, NetPeer peer, ref PropertyCache cache, NetBuffer buffer, int maxBytes)");
-                    sb.AppendLine($"            => {concreteType}.NetworkSerialize(world, peer, ({concreteType})cache.RefValue, buffer, maxBytes);");
-                }
-                sb.AppendLine();
-            }
-            
             sb.AppendLine("        #endregion");
             sb.AppendLine();
             
@@ -643,22 +752,11 @@ namespace Nebula.Generators
                     continue;
                 
                 var methodName = $"OnPeerAcknowledge_{kvp.Key}";
-                sb.AppendLine($"        private static void {methodName}(object obj, UUID peerId)");
-                sb.AppendLine($"            => {typeName}.OnPeerAcknowledge(({typeName})obj, peerId);");
+                sb.AppendLine($"        private static void {methodName}(object obj, UUID peerId, Tick tick)");
+                sb.AppendLine($"            => {typeName}.OnPeerAcknowledge(({typeName})obj, peerId, tick);");
                 sb.AppendLine();
             }
-            
-            // Emit OnPeerAcknowledge for concrete generic types (reference types only)
-            foreach (var (classIndex, concreteType, isValueType) in concreteGenerics)
-            {
-                if (isValueType) continue;
-                
-                var methodName = $"OnPeerAcknowledge_{classIndex}";
-                sb.AppendLine($"        private static void {methodName}(object obj, UUID peerId)");
-                sb.AppendLine($"            => {concreteType}.OnPeerAcknowledge(({concreteType})obj, peerId);");
-                sb.AppendLine();
-            }
-            
+
             sb.AppendLine("        #endregion");
             sb.AppendLine();
             
@@ -688,17 +786,6 @@ namespace Nebula.Generators
                 sb.AppendLine();
             }
             
-            // Emit OnPeerDisconnected for concrete generic types (reference types only)
-            foreach (var (classIndex, concreteType, isValueType) in concreteGenerics)
-            {
-                if (isValueType) continue;
-                
-                var methodName = $"OnPeerDisconnected_{classIndex}";
-                sb.AppendLine($"        private static void {methodName}(object obj, UUID peerId)");
-                sb.AppendLine($"            => {concreteType}.OnPeerDisconnected(({concreteType})obj, peerId);");
-                sb.AppendLine();
-            }
-            
             sb.AppendLine("        #endregion");
             sb.AppendLine();
             
@@ -722,15 +809,9 @@ namespace Nebula.Generators
                 sb.AppendLine($"                [{kvp.Key}] = Serializer_{kvp.Key},");
             }
             
-            // Include concrete generic types in the dictionary
-            foreach (var (classIndex, _, _) in concreteGenerics)
-            {
-                sb.AppendLine($"                [{classIndex}] = Serializer_{classIndex},");
-            }
-            
             sb.AppendLine("            }.ToFrozenDictionary();");
             sb.AppendLine();
-            
+
             // Emit OnPeerAcknowledge dictionary (only reference types)
             sb.AppendLine("        public static readonly FrozenDictionary<int, OnPeerAcknowledgeFunc> OnPeerAcknowledgeFuncs =");
             sb.AppendLine("            new Dictionary<int, OnPeerAcknowledgeFunc>");
@@ -747,13 +828,6 @@ namespace Nebula.Generators
                     continue;
                 
                 sb.AppendLine($"                [{kvp.Key}] = OnPeerAcknowledge_{kvp.Key},");
-            }
-            
-            // Include concrete generic reference types
-            foreach (var (classIndex, _, isValueType) in concreteGenerics)
-            {
-                if (!isValueType)
-                    sb.AppendLine($"                [{classIndex}] = OnPeerAcknowledge_{classIndex},");
             }
             
             sb.AppendLine("            }.ToFrozenDictionary();");
@@ -777,13 +851,6 @@ namespace Nebula.Generators
                 sb.AppendLine($"                [{kvp.Key}] = OnPeerDisconnected_{kvp.Key},");
             }
             
-            // Include concrete generic reference types
-            foreach (var (classIndex, _, isValueType) in concreteGenerics)
-            {
-                if (!isValueType)
-                    sb.AppendLine($"                [{classIndex}] = OnPeerDisconnected_{classIndex},");
-            }
-            
             sb.AppendLine("            }.ToFrozenDictionary();");
             sb.AppendLine();
         }
@@ -802,7 +869,7 @@ namespace Nebula.Generators
         /// Checks if a type name represents an open generic type (e.g., "LazyPeerState&lt;T&gt;").
         /// Open generic types cannot be used directly in generated code.
         /// </summary>
-        private static bool IsOpenGenericType(string typeName)
+        internal static bool IsOpenGenericType(string typeName)
         {
             // Check if the type has generic parameters
             var genericStart = typeName.IndexOf('<');
@@ -831,73 +898,6 @@ namespace Nebula.Generators
             }
             
             return false;
-        }
-        
-        /// <summary>
-        /// Collects concrete generic types used in properties that need serializers generated.
-        /// For example, if a property uses NetArray&lt;Vector3&gt;, we need to generate a serializer for it
-        /// even though the open generic NetArray&lt;T&gt; is registered in StaticMethods.
-        /// </summary>
-        private static List<(int classIndex, string concreteType, bool isValueType)> CollectConcreteGenericTypes(ProtocolData data)
-        {
-            var result = new List<(int, string, bool)>();
-            var seen = new HashSet<int>();
-            
-            // Find all open generic types with their class indices
-            var openGenericIndices = new Dictionary<string, (int index, bool isValueType)>();
-            foreach (var kvp in data.StaticMethods)
-            {
-                var typeName = kvp.Value.TypeFullName;
-                if (IsOpenGenericType(typeName))
-                {
-                    // Extract the base name (e.g., "Nebula.Serialization.NetArray" from "Nebula.Serialization.NetArray<T>")
-                    var genericStart = typeName.IndexOf('<');
-                    if (genericStart > 0)
-                    {
-                        var baseName = typeName.Substring(0, genericStart);
-                        openGenericIndices[baseName] = (kvp.Key, kvp.Value.IsValueType);
-                    }
-                }
-            }
-            
-            // Scan PropertiesLookup: scenePath -> propertyIndex -> PropertyData
-            foreach (var sceneKvp in data.PropertiesLookup)
-            {
-                foreach (var propKvp in sceneKvp.Value)
-                {
-                    var prop = propKvp.Value;
-                    ScanPropertyForConcreteGeneric(prop, openGenericIndices, seen, result);
-                }
-            }
-            
-            return result;
-        }
-        
-        private static void ScanPropertyForConcreteGeneric(
-            PropertyData prop,
-            Dictionary<string, (int index, bool isValueType)> openGenericIndices,
-            HashSet<int> seen,
-            List<(int classIndex, string concreteType, bool isValueType)> result)
-        {
-            var typeName = prop.TypeFullName;
-            
-            // Skip if not a generic type or if it's an open generic
-            if (string.IsNullOrEmpty(typeName) || typeName.IndexOf('<') < 0 || IsOpenGenericType(typeName))
-                return;
-            
-            // Extract base name
-            var genericStart = typeName.IndexOf('<');
-            var baseName = typeName.Substring(0, genericStart);
-            
-            // Check if this is a concrete version of a known open generic
-            if (openGenericIndices.TryGetValue(baseName, out var info))
-            {
-                if (!seen.Contains(info.index))
-                {
-                    seen.Add(info.index);
-                    result.Add((info.index, typeName, info.isValueType));
-                }
-            }
         }
     }
 }

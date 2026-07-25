@@ -12,12 +12,13 @@ config_version=5
 
 world/default_scene="uid://ck5p7purmvbqv"
 config/log_level=4
+config/default_scene="uid://ck5p7purmvbqv"
 
 [application]
 
 config/name="BigChungus"
 run/main_scene="uid://c18ded3drxmoq"
-config/features=PackedStringArray("4.6", "C#", "Mobile")
+config/features=PackedStringArray("4.7", "C#", "Mobile")
 config/icon="res://icon.svg"
 
 [autoload]

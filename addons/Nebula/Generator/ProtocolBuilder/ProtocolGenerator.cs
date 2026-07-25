@@ -30,17 +30,44 @@ namespace Nebula.Generators
                 ))
                 .Collect();
 
-            // Combine compilation, project root, and tscn files
+            // Nebula's own version, from the addon's plugin.cfg. Folded into the protocol
+            // hash so builds on different Nebula versions refuse to connect.
+            var nebulaVersion = context.AdditionalTextsProvider
+                .Where(static file => NormalizePath(file.Path).EndsWith("addons/Nebula/plugin.cfg"))
+                .Select(static (file, ct) => ParsePluginVersion(file.GetText(ct)?.ToString() ?? ""))
+                .Collect()
+                .Select(static (versions, ct) => versions.FirstOrDefault(v => !string.IsNullOrEmpty(v)) ?? "");
+
+            // Combine compilation, project root, tscn files, and Nebula version
             var combined = context.CompilationProvider
                 .Combine(projectRoot)
-                .Combine(tscnFiles);
+                .Combine(tscnFiles)
+                .Combine(nebulaVersion);
 
             // Generate the protocol
             context.RegisterSourceOutput(combined, static (spc, source) =>
             {
-                var ((compilation, projectRoot), files) = source;
-                Execute(spc, compilation, projectRoot, files);
+                var (((compilation, projectRoot), files), nebulaVersion) = source;
+                Execute(spc, compilation, projectRoot, files, nebulaVersion);
             });
+        }
+
+        /// <summary>
+        /// Extracts the <c>version="..."</c> value from a Godot plugin.cfg. Returns an empty
+        /// string if the key is absent, which Execute turns into a build error - a silently
+        /// missing version would weaken the protocol hash rather than fail loudly.
+        /// </summary>
+        private static string ParsePluginVersion(string cfgContents)
+        {
+            foreach (var rawLine in cfgContents.Split('\n'))
+            {
+                var line = rawLine.Trim();
+                var equals = line.IndexOf('=');
+                if (equals < 0) continue;
+                if (line.Substring(0, equals).Trim() != "version") continue;
+                return line.Substring(equals + 1).Trim().Trim('"');
+            }
+            return "";
         }
 
         private static string GetDirectoryPath(string filePath)
@@ -54,7 +81,8 @@ namespace Nebula.Generators
             SourceProductionContext context,
             Compilation compilation,
             string projectRoot,
-            ImmutableArray<(string Path, string Content)> tscnFiles)
+            ImmutableArray<(string Path, string Content)> tscnFiles,
+            string nebulaVersion)
         {
             // Analyze types from compilation, passing project root for path resolution
             var analysisResult = TypeAnalyzer.Analyze(compilation, projectRoot);
@@ -82,9 +110,65 @@ namespace Nebula.Generators
                 fileContents,
                 analysisResult);
 
+            protocolData.NebulaVersion = nebulaVersion;
+
+            // The version is a hash input, not decoration: without it the hash would no
+            // longer separate builds whose wire format changed but whose protocol data
+            // didn't. Fail the build rather than emit a weaker hash.
+            if (string.IsNullOrEmpty(nebulaVersion))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(MissingVersionDescriptor, Location.None));
+                return;
+            }
+
+            // Enforce the per-scene property limit before emitting anything. The runtime
+            // tracks dirty properties in a single 64-bit mask (NetworkController.DirtyMask)
+            // and sizes CachedProperties to 64 - a 65th property would silently alias bit 0
+            // (C# masks shift counts) and index out of bounds. Fail the build instead.
+            ReportPropertyLimitViolations(context, protocolData);
+
             // Emit code
             var code = CodeEmitter.Emit(protocolData);
             context.AddSource("Protocol.g.cs", SourceText.From(code, Encoding.UTF8));
+        }
+
+        /// <summary>
+        /// Maximum networked properties per NetScene, including properties rolled up from
+        /// static children and nested non-NetScene instances. Bound by the 64-bit dirty
+        /// mask in NetworkController. Mirrored at runtime by BitConstants.MaxSceneProperties.
+        /// </summary>
+        private const int MaxSceneProperties = 64;
+
+        private static readonly DiagnosticDescriptor MissingVersionDescriptor = new(
+            "NEBULA005",
+            "Nebula version could not be determined",
+            "Could not read version from addons/Nebula/plugin.cfg. The Nebula version is folded into the protocol handshake hash, so it must be resolvable at build time. Ensure Nebula.props includes plugin.cfg in <AdditionalFiles> and that the file declares a version key.",
+            "Nebula.Generator",
+            DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        private static readonly DiagnosticDescriptor PropertyLimitDescriptor = new(
+            "NEBULA004",
+            "NetScene exceeds the 64-property limit",
+            "NetScene '{0}' has {1} networked properties, exceeding the maximum of {2} per scene (dirty tracking uses a 64-bit mask). Move properties onto nested NetScenes (which have their own limit), or aggregate related values into a single property such as a NetArray or a custom INetSerializable type.",
+            "Nebula.Generator",
+            DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        private static void ReportPropertyLimitViolations(SourceProductionContext context, ProtocolData data)
+        {
+            foreach (var sceneEntry in data.PropertiesLookup)
+            {
+                if (sceneEntry.Value.Count > MaxSceneProperties)
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        PropertyLimitDescriptor,
+                        Location.None,
+                        sceneEntry.Key,
+                        sceneEntry.Value.Count,
+                        MaxSceneProperties));
+                }
+            }
         }
 
         private static ProtocolData BuildProtocol(
@@ -207,7 +291,76 @@ namespace Nebula.Generators
                 }
             }
 
+            RegisterConcreteGenericTypes(data);
+
             return data;
+        }
+
+        /// <summary>
+        /// Registers each distinct CONCRETE generic instantiation (e.g. NetArray&lt;Vector3&gt;) as its
+        /// own serializable type with a unique class index, and repoints the properties that use it.
+        ///
+        /// Why: a property whose type is a concrete generic is resolved by <see cref="LookupClassIndex"/>
+        /// to the OPEN generic's single class index (NetArray&lt;T&gt;). Without this, every element type
+        /// shares one index → one serializer, and a second element type is dispatched through the wrong
+        /// serializer (InvalidCastException). Giving each concrete type its own index makes the existing
+        /// StaticMethods-walking emitters generate a correct serializer per element type.
+        ///
+        /// Deterministic: concrete types are sorted by name before index assignment so server and client
+        /// (which compile the same protocol) derive identical indices — the handshake hash folds in both
+        /// prop.ClassIndex and the StaticMethods entries.
+        /// </summary>
+        private static void RegisterConcreteGenericTypes(ProtocolData data)
+        {
+            // Find concrete-generic properties that fell back to an OPEN generic index, and the open
+            // generic they resolved to (whose MethodType/IsValueType the concrete type inherits).
+            var concreteToOpen = new Dictionary<string, SerializableMethodData>();
+            foreach (var sceneProps in data.PropertiesLookup.Values)
+            {
+                foreach (var prop in sceneProps.Values)
+                {
+                    if (prop.ClassIndex < 0) continue;
+                    if (!data.StaticMethods.TryGetValue(prop.ClassIndex, out var resolved)) continue;
+                    if (!CodeEmitter.IsOpenGenericType(resolved.TypeFullName)) continue; // resolved to the open generic
+
+                    var concrete = prop.TypeFullName;
+                    if (string.IsNullOrEmpty(concrete) || concrete.IndexOf('<') < 0 || CodeEmitter.IsOpenGenericType(concrete))
+                        continue; // property type must itself be a concrete generic
+
+                    concreteToOpen[concrete] = resolved;
+                }
+            }
+
+            if (concreteToOpen.Count == 0)
+                return;
+
+            // Deterministic assignment: sort by name, continue the class-index counter.
+            var sortedConcrete = new List<string>(concreteToOpen.Keys);
+            sortedConcrete.Sort(System.StringComparer.Ordinal);
+            var nextIndex = data.StaticMethods.Count == 0 ? 0 : data.StaticMethods.Keys.Max() + 1;
+
+            var concreteToIndex = new Dictionary<string, int>();
+            foreach (var concrete in sortedConcrete)
+            {
+                var openGen = concreteToOpen[concrete];
+                data.StaticMethods[nextIndex] = new SerializableMethodData
+                {
+                    MethodType = openGen.MethodType,
+                    TypeFullName = concrete,
+                    IsValueType = openGen.IsValueType
+                };
+                data.SerialTypePack[concrete] = nextIndex;
+                concreteToIndex[concrete] = nextIndex;
+                nextIndex++;
+            }
+
+            // Repoint every property using a now-registered concrete type. PropertyData is a shared
+            // reference, so patching via PropertiesLookup also updates PropertiesMap /
+            // PropertiesByStaticChildId (same objects) and the protocol hash (reads prop.ClassIndex).
+            foreach (var sceneProps in data.PropertiesLookup.Values)
+                foreach (var prop in sceneProps.Values)
+                    if (concreteToIndex.TryGetValue(prop.TypeFullName, out var concreteIndex))
+                        prop.ClassIndex = concreteIndex;
         }
 
         private static SceneBytecode GenerateSceneBytecode(
@@ -432,7 +585,10 @@ namespace Nebula.Generators
                         {
                             funcData.Arguments.Add(new ArgumentData
                             {
-                                TypeFullName = param.TypeFullName
+                                TypeFullName = param.TypeFullName,
+                                IsEnum = param.IsEnum,
+                                EnumUnderlyingTypeName = param.EnumUnderlyingTypeName,
+                                SubtypeIdentifier = param.IsEnum ? param.EnumUnderlyingTypeName : null
                             });
                         }
 
