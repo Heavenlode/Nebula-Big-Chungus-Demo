@@ -4,6 +4,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using Godot;
+using MongoDB.Bson;
 using Nebula.Internal.Editor.DTO;
 using Nebula.Serialization;
 using Nebula.Utility.Tools;
@@ -100,7 +101,29 @@ namespace Nebula
             public NetPeer Sender;
         }
 
-        public UUID WorldId { get; internal set; }
+        private UUID _worldId;
+
+        /// <summary>
+        /// Identity of this world.
+        ///
+        /// <para>On the server this is assigned at construction. On the client
+        /// it starts empty — nothing in the initial join handshake carries it —
+        /// and is only learned if the peer is later migrated to another world.
+        /// The setter re-announces on the debug channel so an attached debugger
+        /// follows the change rather than showing a stale entry.</para>
+        /// </summary>
+        public UUID WorldId
+        {
+            get => _worldId;
+            internal set
+            {
+                if (_worldId == value)
+                    return;
+                var previous = _worldId;
+                _worldId = value;
+                Hub?.ReannounceWorld(this, previous);
+            }
+        }
 
         // A hierarchical bitmask of all nodes in use on the client side.
         // 8 groups of 64 nodes each (512 total).
@@ -130,144 +153,79 @@ namespace Nebula
         private Dictionary<long, NetId> networkIds = [];
         internal Dictionary<NetId, NetworkController> NetScenes = [];
 
-        // TCP debug server fields
-        private TcpListener DebugTcpListener { get; set; }
-        private List<TcpClient> DebugTcpClients { get; } = new();
-        private readonly object _debugClientsLock = new();
+        /// <summary>
+        /// The process-wide debug channel, or null when debugging wasn't
+        /// requested. Every emitter below gates on <c>is { HasClients: true }</c>
+        /// so the debug path costs a null check when nobody is watching.
+        /// </summary>
+        private static DebugHub Hub => NetRunner.Instance?.DebugHub;
 
-        public enum DebugDataType
+        /// <summary>
+        /// Frame types on the debug channel. Values are explicit and MUST NOT
+        /// be reordered: the integration harness
+        /// (Testing/Integration/GodotProcess.cs) identifies DEBUG_EVENT frames
+        /// by the literal byte 6.
+        /// </summary>
+        public enum DebugDataType : byte
         {
-            TICK,
-            PAYLOADS,
-            EXPORT,
-            LOGS,
-            PEERS,
-            CALLS,
-            DEBUG_EVENT
+            TICK = 0,
+            PAYLOADS = 1,
+            EXPORT = 2,
+            LOGS = 3,
+            PEERS = 4,
+            CALLS = 5,
+            DEBUG_EVENT = 6,
+            WORLD_ANNOUNCE = 7,
+            WORLD_REMOVED = 8,
         }
 
         /// <summary>
-        /// Sends debug events to connected debug clients (e.g., test runners).
-        /// Buffers messages until a client connects, then flushes the buffer.
+        /// Sends named debug events (e.g. "Spawn", "Input") on this world's
+        /// debug channel. Consumed by the integration harness, which waits on
+        /// specific category/message pairs.
+        ///
+        /// Buffering of pre-connection events now lives in
+        /// <see cref="DebugHub"/>, which owns the socket; this is a thin
+        /// world-scoped facade over it.
         /// </summary>
         public class DebugMessenger
         {
             private readonly WorldRunner _world;
-            private readonly List<byte[]> _pendingMessages = new();
-            private readonly object _bufferLock = new();
-            private bool _hasSentBufferedMessages = false;
 
             public DebugMessenger(WorldRunner world)
             {
                 _world = world;
             }
 
-            /// <summary>
-            /// Sends a debug event with a category and message to all connected debug peers.
-            /// If no clients are connected, buffers the message until one connects.
-            /// </summary>
             /// <param name="category">Event category (e.g., "Spawn", "Connect")</param>
             /// <param name="message">Event message/details</param>
             public void Send(string category, string message)
             {
-                if (_world.DebugTcpListener == null) return;
+                var hub = Hub;
+                if (hub == null) return;
 
-                using var buffer = new NetBuffer();
-                NetWriter.WriteByte(buffer, (byte)DebugDataType.DEBUG_EVENT);
+                // Sized explicitly: NetBuffer throws on overflow rather than
+                // growing, and its 1536-byte default is not guaranteed to fit
+                // an arbitrary message.
+                using var buffer = new NetBuffer((category.Length + message.Length) * 4 + 32, usePool: false);
                 NetWriter.WriteString(buffer, category);
                 NetWriter.WriteString(buffer, message);
 
-                // Wrap with length prefix for TCP framing
-                var framedData = CreateFramedPacket(buffer);
-
-                lock (_bufferLock)
-                {
-                    if (_world.DebugTcpClients.Count == 0)
-                    {
-                        // No clients yet - buffer the message
-                        _pendingMessages.Add(framedData);
-                        return;
-                    }
-                }
-
-                _world.SendToDebugClients(framedData);
-            }
-
-            /// <summary>
-            /// Flushes any buffered messages to connected clients.
-            /// Called when a new debug client connects.
-            /// </summary>
-            internal void FlushBuffer()
-            {
-                lock (_bufferLock)
-                {
-                    if (_pendingMessages.Count == 0 || _hasSentBufferedMessages) return;
-
-                    foreach (var framedData in _pendingMessages)
-                    {
-                        _world.SendToDebugClients(framedData);
-                    }
-
-                    _pendingMessages.Clear();
-                    _hasSentBufferedMessages = true;
-                }
+                hub.Enqueue(_world.WorldId, DebugDataType.DEBUG_EVENT, buffer, lossy: false);
             }
         }
 
         /// <summary>
-        /// Creates a TCP framed packet with a 4-byte length prefix.
-        /// </summary>
-        private static byte[] CreateFramedPacket(NetBuffer buffer)
-        {
-            var lengthPrefix = BitConverter.GetBytes(buffer.Length);
-            var framedData = new byte[4 + buffer.Length];
-            Array.Copy(lengthPrefix, 0, framedData, 0, 4);
-            buffer.WrittenSpan.CopyTo(framedData.AsSpan(4));
-            return framedData;
-        }
-
-        private void SendToDebugClients(byte[] data)
-        {
-            lock (_debugClientsLock)
-            {
-                var clientsToRemove = new List<TcpClient>();
-                foreach (var client in DebugTcpClients)
-                {
-                    try
-                    {
-                        if (client.Connected)
-                        {
-                            var stream = client.GetStream();
-                            stream.Write(data, 0, data.Length);
-                            stream.Flush(); // Ensure data is sent immediately
-                        }
-                        else
-                        {
-                            clientsToRemove.Add(client);
-                        }
-                    }
-                    catch
-                    {
-                        clientsToRemove.Add(client);
-                    }
-                }
-                foreach (var client in clientsToRemove)
-                {
-                    DebugTcpClients.Remove(client);
-                    try { client.Close(); } catch { }
-                }
-            }
-        }
-
-        /// <summary>
-        /// Debug messenger for sending test events via TCP.
+        /// Debug messenger for sending test events on the debug channel.
         /// </summary>
         public DebugMessenger Debug { get; private set; }
 
         /// <summary>
-        /// Port for the debug TCP connection. 0 means use a random available port.
+        /// Port this process' debug channel is listening on, or 0 when
+        /// debugging is off. Read-only now that the channel is process-wide
+        /// rather than per-world.
         /// </summary>
-        public int DebugPort { get; set; } = 0;
+        public int DebugPort => Hub?.BoundPort ?? 0;
 
         // Diagnostic counter for RPC calls - remove after debugging
         public static long TotalRpcCallsProcessed = 0;
@@ -294,24 +252,6 @@ namespace Nebula
             Log(handler.ToStringAndClear(), level);
         }
 
-        private int GetAvailablePort()
-        {
-            // Create a listener on port 0, which tells the OS to assign an available port
-            TcpListener listener = new TcpListener(IPAddress.Loopback, 0);
-
-            try
-            {
-                listener.Start();
-                int port = ((IPEndPoint)listener.LocalEndpoint).Port;
-
-                return port;
-            }
-            finally
-            {
-                listener.Stop();
-            }
-        }
-
         Action<uint> _onPeerDisconnectedHandler;
 
         public override void _Ready()
@@ -320,18 +260,11 @@ namespace Nebula
             Name = "WorldRunner";
             Debug = new DebugMessenger(this);
 
-            // Parse command line args
+            // Parse command line args (--debugPort is handled once, process-wide,
+            // in NetRunner.StartDebugHub)
             foreach (var argument in OS.GetCmdlineArgs())
             {
-                if (argument.StartsWith("--debugPort="))
-                {
-                    var value = argument.Substring("--debugPort=".Length);
-                    if (int.TryParse(value, out int parsedPort))
-                    {
-                        DebugPort = parsedPort;
-                    }
-                }
-                else if (argument.StartsWith("--clientId=") && !_clientIdParsed)
+                if (argument.StartsWith("--clientId=") && !_clientIdParsed)
                 {
                     var value = argument.Substring("--clientId=".Length);
                     if (int.TryParse(value, out int parsedId))
@@ -342,52 +275,14 @@ namespace Nebula
                 }
             }
 
-            // Debug TCP server is opt-in (dedicated servers should not start it by default).
-            // Enable via either:
-            // - command line: --debugPort=XXXX
-            // - project setting: Nebula/config/enable_tcp = true
-            bool enableDebugTcp =
-                DebugPort > 0 ||
-                ProjectSettings.GetSetting("Nebula/config/enable_tcp", false).AsBool();
-
-            if (enableDebugTcp)
+            // Announce this world on the process-wide debug channel. Registering
+            // from here rather than from NetRunner.Worlds is what makes it work
+            // on clients, where Worlds is never populated.
+            var hub = Hub;
+            if (hub != null)
             {
-                int port = DebugPort > 0 ? DebugPort : GetAvailablePort();
-                int attempts = 0;
-                const int MAX_ATTEMPTS = 1000;
-
-                while (attempts < MAX_ATTEMPTS)
-                {
-                    try
-                    {
-                        DebugTcpListener = new TcpListener(IPAddress.Loopback, port);
-                        DebugTcpListener.Start();
-                        Log(Debugger.DebugLevel.VERBOSE, $"World {WorldId} debug TCP server started on port {port}");
-                        break;
-                    }
-                    catch (SocketException ex)
-                    {
-                        if (DebugPort > 0)
-                        {
-                            // Fixed port requested but failed - don't retry with random ports
-                            Log(Debugger.DebugLevel.ERROR, $"Error starting debug TCP server on fixed port {DebugPort}: {ex.Message}");
-                            DebugTcpListener = null;
-                            break;
-                        }
-                        port = GetAvailablePort();
-                        attempts++;
-                    }
-                }
-
-                if (attempts >= MAX_ATTEMPTS)
-                {
-                    Log(Debugger.DebugLevel.ERROR, $"Error starting debug TCP server after {attempts} attempts");
-                    DebugTcpListener = null;
-                }
-            }
-            else
-            {
-                DebugTcpListener = null;
+                hub.RegisterWorld(this);
+                TreeExiting += OnTreeExitingUnregisterDebug;
             }
 
             if (NetRunner.Instance.IsServer)
@@ -417,24 +312,104 @@ namespace Nebula
         {
             base._ExitTree();
 
-            // Cleanup debug TCP server for both server and client
-            if (DebugTcpListener != null)
-            {
-                lock (_debugClientsLock)
-                {
-                    foreach (var client in DebugTcpClients)
-                    {
-                        try { client.Close(); } catch { }
-                    }
-                    DebugTcpClients.Clear();
-                }
-                DebugTcpListener.Stop();
-            }
-
             if (NetRunner.Instance.IsServer)
             {
                 NetRunner.Instance.OnPeerDisconnected -= _onPeerDisconnectedHandler;
             }
+        }
+
+        /// <summary>
+        /// There is no world-destroyed event on NetRunner (Worlds is never
+        /// pruned), so tree exit is the signal that a world went away — the
+        /// same approach PeerPhysicsRunner uses.
+        /// </summary>
+        private void OnTreeExitingUnregisterDebug()
+        {
+            Hub?.UnregisterWorld(this);
+        }
+
+        private int _debugExportCounter;
+
+        /// <summary>
+        /// Full world state for the debugger's node tree and property
+        /// inspector. Reuses the persistence serializer
+        /// (<c>NetNodeCommon.ToBSONDocument</c>) rather than a bespoke walk, so
+        /// the property-to-value mapping stays generated in one place.
+        ///
+        /// <para>Shipped as RelaxedExtendedJson, not BSON bytes: the editor
+        /// converts to JSON immediately anyway, and the two BSON
+        /// implementations in play (MongoDB here, LiteDB there) do not agree on
+        /// their type sets. Relaxed mode specifically — the default Shell mode
+        /// emits <c>NumberLong(5)</c>, which is not valid JSON.</para>
+        ///
+        /// <para>Only runs while a debug client is attached, and never throws
+        /// into the tick loop.</para>
+        /// </summary>
+        private void EmitDebugWorldState(DebugHub hub)
+        {
+            if (RootScene?.NetNode is not IBsonSerializableBase root)
+                return;
+            if (_debugExportCounter++ % NetRunner.DebugExportInterval != 0)
+                return;
+
+            string json;
+            try
+            {
+                // Visited set guards against reference cycles: a NetNode-typed
+                // [NetProperty] pointing back at an ancestor would otherwise
+                // recurse until the stack blows, taking the process with it.
+                var state = root.BsonSerialize(new NetBsonContext
+                {
+                    Recurse = true,
+                    Visited = new HashSet<Node>(),
+                });
+                json = state.ToJson(new MongoDB.Bson.IO.JsonWriterSettings
+                {
+                    OutputMode = MongoDB.Bson.IO.JsonOutputMode.RelaxedExtendedJson,
+                });
+            }
+            catch (Exception ex)
+            {
+                Log(Debugger.DebugLevel.ERROR, $"Debug world-state export failed: {ex.Message}");
+                return;
+            }
+
+            using var buffer = new NetBuffer(json.Length * 4 + 64, usePool: false);
+            NetWriter.WriteString(buffer, json);
+            hub.Enqueue(WorldId, DebugDataType.EXPORT, buffer, lossy: true);
+        }
+
+        /// <summary>
+        /// Per-peer sync status for the debugger's Peers tab. Live only — this
+        /// is a "what is happening right now" view, so it is not persisted into
+        /// tick frames. Emitted at roughly 1 Hz.
+        /// </summary>
+        private void EmitDebugPeers(DebugHub hub)
+        {
+            if (PeerStates.Count == 0)
+                return;
+            if (NetRunner.TPS <= 0 || CurrentTick % NetRunner.TPS != 0)
+                return;
+
+            const int BytesPerPeer = 16 + 4 + 1 + 2;
+            int count = Math.Min(PeerStates.Count, byte.MaxValue);
+
+            using var buffer = new NetBuffer(1 + count * BytesPerPeer + 16, usePool: false);
+            NetWriter.WriteByte(buffer, (byte)count);
+
+            int written = 0;
+            foreach (var peerState in PeerStates.Values)
+            {
+                if (written >= count)
+                    break;
+                NetWriter.WriteBytes(buffer, peerState.Id.ToByteArray());
+                NetWriter.WriteInt32(buffer, peerState.Tick);
+                NetWriter.WriteByte(buffer, (byte)peerState.Status);
+                NetWriter.WriteUInt16(buffer, (ushort)Math.Min(peerState.OwnedNodes?.Count ?? 0, ushort.MaxValue));
+                written++;
+            }
+
+            hub.Enqueue(WorldId, DebugDataType.PEERS, buffer, lossy: true);
         }
 
         /// <summary>
@@ -687,6 +662,19 @@ namespace Nebula
         private NetBuffer _ackBuffer;
 
         /// <summary>
+        /// A tick the client has applied but not yet acknowledged, held so it can ride along on the
+        /// next outgoing input packet instead of costing its own datagram. -1 when nothing is
+        /// waiting. Never held longer than one physics frame — _PhysicsProcess flushes it.
+        /// </summary>
+        private Tick _pendingAckTick = -1;
+
+        /// <summary>
+        /// Whether this prediction tick already attached the pending ack to an input packet.
+        /// SendInput runs once per owned node, and only the first should carry it.
+        /// </summary>
+        private bool _ackAttachedThisFrame;
+
+        /// <summary>
         /// Initializes client prediction state from the first received server tick.
         /// </summary>
         private void InitializeClientPrediction(Tick serverTick)
@@ -728,23 +716,90 @@ namespace Nebula
         /// Called from the independent client tick loop in _PhysicsProcess.
         /// </summary>
         /// <summary>
-        /// Hard ceiling on how far prediction may run ahead of the confirmed tick. The lead only
-        /// ever grows (confirmed ticks stall during hitches or import errors while prediction
-        /// free-runs), and past SERVER_INPUT_BUFFER_SIZE (64) the server's input ring evicts
-        /// stamped inputs before consuming them — movement then runs on frozen stale inputs.
-        /// Throttling here lets the confirmed timeline catch up instead.
+        /// Hard ceiling on how far prediction may run ahead of the confirmed tick — a
+        /// last-resort backstop behind the adaptive slew below. Past
+        /// SERVER_INPUT_BUFFER_SIZE (64) the server's input ring evicts stamped inputs
+        /// before consuming them, so movement would run on frozen stale inputs.
         /// </summary>
         private const int MaxPredictionLeadTicks = 30;
 
+        // ============================================================
+        // ADAPTIVE PREDICTION LEAD (slew)
+        // ============================================================
+        // The lead (_clientPredictedTick - CurrentTick) is a ratchet without correction:
+        // server stalls and clock-rate drift between machines only ever grow it, and a
+        // stale lead never decays on its own — clients ended up pinned at the hard cap,
+        // carrying (lead - RTT) ticks of pointless input latency and max-width resim
+        // windows forever. The slew continuously steers the lead toward an RTT-derived
+        // target by occasionally skipping one prediction tick (sheds debt; the server
+        // holds last-known input across the gap) or running one extra (builds the lead
+        // at session start so inputs arrive before the server needs them).
+
+        /// <summary>Extra ticks above raw RTT so jitter doesn't starve the server of inputs.</summary>
+        private const int LEAD_JITTER_MARGIN_TICKS = 2;
+        /// <summary>Dead zone around the target before the slew engages, to avoid oscillation.</summary>
+        private const int LEAD_SLACK = 2;
+        /// <summary>Slew at most one tick per this many eligible frames (~7.5 ticks/s at TPS 30).</summary>
+        private const int SLEW_INTERVAL = 4;
+        /// <summary>Minimum target lead even at zero measured RTT (loopback).</summary>
+        private const int MIN_TARGET_LEAD = 2;
+
+        /// <summary>Counts eligible prediction frames (divider hits), phasing the slew.</summary>
+        private ulong _eligibleFrameIndex = 0;
+
+        /// <summary>
+        /// How many ticks of prediction lead this client should hold: enough for an input
+        /// stamped now to cross the wire before the server's timeline reaches its tick,
+        /// plus a jitter margin. Clamped safely inside the hard cap.
+        /// </summary>
+        internal static int ComputeTargetLeadTicks(uint rttMs, int tps)
+        {
+            int rttTicks = (int)Math.Ceiling(rttMs / 1000.0 * tps);
+            return Math.Clamp(rttTicks + LEAD_JITTER_MARGIN_TICKS, MIN_TARGET_LEAD, MaxPredictionLeadTicks - 2);
+        }
+
+        /// <summary>
+        /// Slew decision for one eligible frame: 1 is steady state; 0 sheds one tick of
+        /// excess lead; 2 builds one tick of missing lead. Correction is rate-limited to
+        /// one tick per SLEW_INTERVAL eligible frames so a 25-tick debt drains in a few
+        /// seconds without perceptible stutter.
+        /// </summary>
+        internal static int PredictionTicksThisFrame(int lead, int targetLead, ulong eligibleFrameIndex)
+        {
+            if (eligibleFrameIndex % SLEW_INTERVAL != 0)
+            {
+                return 1;
+            }
+            if (lead > targetLead + LEAD_SLACK)
+            {
+                return 0;
+            }
+            if (lead < targetLead - LEAD_SLACK)
+            {
+                return 2;
+            }
+            return 1;
+        }
+
         private int _predictionThrottleLogCounter = 0;
+
+        /// <summary>Wall-clock msec of the last confirmed-stall warning (rate limit).</summary>
+        private ulong _lastStallLogMsec = 0;
 
         private void RunClientPredictionTick()
         {
             if (_clientPredictedTick - CurrentTick >= MaxPredictionLeadTicks)
             {
-                if ((_predictionThrottleLogCounter++ % 30) == 0)
+                // With the slew active, hitting the cap means correction is losing the
+                // race against lead growth — the server is losing time faster than the
+                // client can shed it. Warn on first engage, then every ~10s while pinned.
+                if ((_predictionThrottleLogCounter++ % 300) == 0)
+                {
+                    uint rtt = NetRunner.Instance.ServerPeer.IsSet ? NetRunner.Instance.ServerPeer.RoundTripTime : 0;
                     Log(Debugger.DebugLevel.WARN,
-                        $"[Prediction] Throttled: predicted tick {_clientPredictedTick} is {_clientPredictedTick - CurrentTick} ahead of confirmed {CurrentTick}");
+                        $"[Prediction] Lead capped: predicted {_clientPredictedTick} is {_clientPredictedTick - CurrentTick} ahead of confirmed {CurrentTick} " +
+                        $"(rtt {rtt}ms, target lead {ComputeTargetLeadTicks(rtt, NetRunner.TPS)}) — confirmed timeline is falling behind faster than the slew can shed lead");
+                }
                 return;
             }
 
@@ -1135,6 +1190,8 @@ namespace Nebula
 
             PeerStates.Remove(peerId);
             _peerLastAckTick.Remove(peerId);
+            ResetPackState(peerId);
+            _peerPackWindows.Remove(peerId);
             _peerPendingAcks.Remove(peerId); // Fix #5: Clean up pending acks tracking
             _peerNetBufferPool.Remove(peerId); // Clean up pooled export buffer
             _peerListDirty = true; // Fix #1: Mark peer list as dirty
@@ -1266,14 +1323,20 @@ namespace Nebula
             _isProcessingNetScenes = false;
             FlushPendingNetSceneChanges();
 
-            if (DebugTcpListener != null && DebugTcpClients.Count > 0)
+            var debugHub = Hub;
+            bool debugAttached = debugHub is { HasClients: true };
+
+            if (debugAttached)
             {
-                // Notify the Debugger of the incoming tick
-                using var debugBuffer = new NetBuffer();
-                NetWriter.WriteByte(debugBuffer, (byte)DebugDataType.TICK);
+                // Notify the Debugger of the incoming tick. Reliable: the editor
+                // keys every other frame off the tick that opened it.
+                using var debugBuffer = new NetBuffer(16, usePool: false);
                 NetWriter.WriteInt64(debugBuffer, DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond);
                 NetWriter.WriteInt32(debugBuffer, CurrentTick);
-                SendToDebugClients(CreateFramedPacket(debugBuffer));
+                debugHub.Enqueue(WorldId, DebugDataType.TICK, debugBuffer, lossy: false);
+
+                EmitDebugWorldState(debugHub);
+                EmitDebugPeers(debugHub);
             }
 
             foreach (var queuedFunction in queuedNetFunctions)
@@ -1295,11 +1358,10 @@ namespace Nebula
                 functionNode.Network.IsInboundCall = false;
                 NetFunctionContext = new NetFunctionCtx { };
 
-                if (DebugTcpListener != null && DebugTcpClients.Count > 0)
+                if (debugAttached)
                 {
                     // Notify the Debugger of the function call
-                    using var debugBuffer = new NetBuffer();
-                    NetWriter.WriteByte(debugBuffer, (byte)DebugDataType.CALLS);
+                    using var debugBuffer = new NetBuffer(NetRunner.MTU + 64, usePool: false);
                     NetWriter.WriteString(debugBuffer, queuedFunction.FunctionInfo.Name);
                     NetWriter.WriteByte(debugBuffer, (byte)queuedFunction.Args.Length);
                     for (int i = 0; i < queuedFunction.Args.Length; i++)
@@ -1308,20 +1370,19 @@ namespace Nebula
                         NetWriter.WriteByte(debugBuffer, (byte)cache.Type);
                         WriteFromPropertyCache(debugBuffer, queuedFunction.FunctionInfo.Arguments[i], ref cache);
                     }
-                    SendToDebugClients(CreateFramedPacket(debugBuffer));
+                    debugHub.Enqueue(WorldId, DebugDataType.CALLS, debugBuffer, lossy: false);
                 }
             }
             queuedNetFunctions.Clear();
 
-            if (DebugTcpListener != null && DebugTcpClients.Count > 0)
+            if (debugAttached)
             {
                 foreach (var log in tickLogBuffer)
                 {
-                    using var logBuffer = new NetBuffer();
-                    NetWriter.WriteByte(logBuffer, (byte)DebugDataType.LOGS);
+                    using var logBuffer = new NetBuffer(log.Message.Length * 4 + 32, usePool: false);
                     NetWriter.WriteByte(logBuffer, (byte)log.Level);
                     NetWriter.WriteString(logBuffer, log.Message);
-                    SendToDebugClients(CreateFramedPacket(logBuffer));
+                    debugHub.Enqueue(WorldId, DebugDataType.LOGS, logBuffer, lossy: false);
                 }
             }
             tickLogBuffer.Clear();
@@ -1356,23 +1417,44 @@ namespace Nebula
                             continue;
                         }
 
+                        var packPayload = peerStateBuffer.WrittenSpan;
+
                         using var buffer = new NetBuffer();
                         NetWriter.WriteInt32(buffer, CurrentTick);
-                        NetWriter.WriteBytes(buffer, peerStateBuffer.WrittenSpan);
-                        var size = buffer.Length;
-                        if (size > NetRunner.MTU)
+                        _peerPackWindows.TryGetValue(peerId, out var packWindow);
+                        NebulaPack.WritePacket(
+                            buffer, packPayload, packWindow, CurrentTick,
+                            NetRunner.PackEnabled, NetRunner.PackValidate);
+
+                        // Check the UNCOMPRESSED size against the MTU. Checking the compressed size
+                        // would let compression mask a genuinely oversized world, and the payload
+                        // still has to fit whenever no baseline is available.
+                        var rawSize = sizeof(int) + 1 + packPayload.Length;
+                        if (rawSize > NetRunner.MTU)
                         {
-                            Log(Debugger.DebugLevel.ERROR, $"[MTU EXCEEDED] Peer {peer.ID} tick {CurrentTick}: Data size {size} exceeds MTU {NetRunner.MTU} - PACKET MAY BE CORRUPTED!");
+                            Log(Debugger.DebugLevel.ERROR, $"[MTU EXCEEDED] Peer {peer.ID} tick {CurrentTick}: Uncompressed size {rawSize} exceeds MTU {NetRunner.MTU} (on wire {buffer.Length}) - PACKET MAY BE CORRUPTED!");
                         }
 
                         NetRunner.SendUnreliableSequenced(peer, (byte)NetRunner.ENetChannelId.Tick, buffer);
-                        if (DebugTcpListener != null && DebugTcpClients.Count > 0)
+
+                        // Remember what we sent; it becomes a delta baseline once this peer acks it.
+                        RecordPackPayload(peerId, peerStateBuffer.WrittenSpan);
+
+                        if (debugAttached)
                         {
-                            using var debugBuffer = new NetBuffer();
-                            NetWriter.WriteByte(debugBuffer, (byte)DebugDataType.PAYLOADS);
+                            // Sized from the payload, not NetBuffer's 1536-byte
+                            // default: that default only cleared the old header
+                            // by ~119 bytes at the stock MTU, so any project
+                            // raising Nebula/config/mtu made this throw.
+                            using var debugBuffer = new NetBuffer(16 + 4 + peerStateBuffer.Length + 16, usePool: false);
                             NetWriter.WriteBytes(debugBuffer, peerState.Id.ToByteArray());
+                            // The size actually put on the wire for this peer, which is
+                            // what the debugger charts against the MTU. The state bytes
+                            // that follow are the pre-pack payload kept for inspection,
+                            // so their length is NOT the transmitted size.
+                            NetWriter.WriteInt32(debugBuffer, buffer.Length);
                             NetWriter.WriteBytes(debugBuffer, peerStateBuffer.WrittenSpan);
-                            SendToDebugClients(CreateFramedPacket(debugBuffer));
+                            debugHub.Enqueue(WorldId, DebugDataType.PAYLOADS, debugBuffer, lossy: true);
                         }
                     }
                 }
@@ -1580,26 +1662,7 @@ namespace Nebula
         {
             base._PhysicsProcess(delta);
 
-            // Accept pending TCP debug connections
-            if (DebugTcpListener != null && DebugTcpListener.Pending())
-            {
-                try
-                {
-                    var client = DebugTcpListener.AcceptTcpClient();
-                    lock (_debugClientsLock)
-                    {
-                        DebugTcpClients.Add(client);
-                    }
-                    Log(Debugger.DebugLevel.VERBOSE, $"Debug client connected");
-
-                    // Flush any buffered debug messages now that we have a client
-                    Debug?.FlushBuffer();
-                }
-                catch (Exception ex)
-                {
-                    Log(Debugger.DebugLevel.ERROR, $"Error accepting debug client: {ex.Message}");
-                }
-            }
+            // Debug clients are accepted process-wide by NetRunner._Process.
 
             if (NetRunner.Instance.IsServer)
             {
@@ -1631,15 +1694,60 @@ namespace Nebula
             }
 
             // CLIENT: Independent prediction tick loop
-            if (NetRunner.Instance.IsClient && _predictionInitialized)
+            if (NetRunner.Instance.IsClient)
             {
-                _clientFrameCounter += 1;
-                if (_clientFrameCounter >= NetRunner.PhysicsTicksPerNetworkTick)
+                if (_predictionInitialized)
                 {
-                    _clientFrameCounter = 0;
-                    RunClientPredictionTick();
+                    _clientFrameCounter += 1;
+                    if (_clientFrameCounter >= NetRunner.PhysicsTicksPerNetworkTick)
+                    {
+                        _clientFrameCounter = 0;
+                        _eligibleFrameIndex++;
+
+                        // Adaptive lead slew: steer the predicted timeline toward an
+                        // RTT-derived lead instead of free-running (see the slew block
+                        // above RunClientPredictionTick for why).
+                        uint rttMs = NetRunner.Instance.ServerPeer.IsSet
+                            ? NetRunner.Instance.ServerPeer.RoundTripTime
+                            : 0;
+                        int targetLead = ComputeTargetLeadTicks(rttMs, NetRunner.TPS);
+                        int lead = _clientPredictedTick - CurrentTick;
+                        int ticksToRun = PredictionTicksThisFrame(lead, targetLead, _eligibleFrameIndex);
+
+                        for (int t = 0; t < ticksToRun; t++)
+                        {
+                            // Per prediction tick, not per frame: SendInput refuses to
+                            // piggyback an ack once this is set, so a double-tick frame
+                            // must clear it before each run.
+                            _ackAttachedThisFrame = false;
+                            RunClientPredictionTick();
+                        }
+                    }
+                }
+
+                // Anything RunClientPredictionTick didn't manage to attach to an input packet goes
+                // out on its own. This sits OUTSIDE the _predictionInitialized check on purpose:
+                // PeerAcknowledge is what moves a peer from INITIAL to IN_WORLD, and before
+                // prediction starts the client owns nothing, so there is no input packet to ride
+                // on. Gating this would deadlock the join.
+                if (_pendingAckTick >= 0)
+                {
+                    SendStandaloneAck(_pendingAckTick);
+                    _pendingAckTick = -1;
                 }
             }
+        }
+
+        /// <summary>
+        /// Sends a tick acknowledgement as its own packet, the way every ack used to go out.
+        /// Used when no input packet was available to carry it.
+        /// </summary>
+        private void SendStandaloneAck(Tick tick)
+        {
+            _ackBuffer ??= new NetBuffer();
+            _ackBuffer.Reset();
+            NetWriter.WriteInt32(_ackBuffer, tick);
+            NetRunner.SendUnreliableSequenced(NetRunner.Instance.ServerPeer, (byte)NetRunner.ENetChannelId.Tick, _ackBuffer);
         }
 
         /// <summary>
@@ -1790,6 +1898,11 @@ namespace Nebula
             CurrentTick = -1;
             _predictionInitialized = false;
             _clientPredictedTick = -1;
+
+            // Node ids are per-peer-per-world, so a payload captured in the old world would decode
+            // into entirely the wrong nodes. The destination world also restarts near tick 0, which
+            // would otherwise collide with retained ring slots.
+            _clientPackWindow.Reset();
             TimeSinceLastTick = 0f;
             _ownedEntities.Clear();
             _ownedEntitiesDirty = true;
@@ -1816,6 +1929,49 @@ namespace Nebula
         /// Tracks the last tick each peer acknowledged. Used for timeout detection.
         /// </summary>
         private Dictionary<UUID, Tick> _peerLastAckTick = new();
+
+        /// <summary>
+        /// NebulaPack, server side: the recent payloads sent to each peer. Each entry is marked
+        /// acked as that peer's ack for it arrives, and only marked entries may be used as a delta
+        /// baseline.
+        ///
+        /// Don't try to drive this off <see cref="_peerLastAckTick"/> above. That tracks only the
+        /// newest ack, which is fine for timeout detection but says nothing about whether any
+        /// particular older tick arrived.
+        /// </summary>
+        private Dictionary<UUID, NebulaPackWindow> _peerPackWindows = new();
+
+        /// <summary>
+        /// NebulaPack, client side: the payloads this client has applied and acked, which is exactly
+        /// the set the server is allowed to delta against.
+        /// </summary>
+        private readonly NebulaPackWindow _clientPackWindow = new();
+        private NetBuffer _clientPackBuffer;
+
+        /// <summary>
+        /// Remembers the payload just sent to a peer, so it can be used as a delta baseline once
+        /// that peer acknowledges the tick.
+        /// </summary>
+        private void RecordPackPayload(UUID peerId, ReadOnlySpan<byte> payload)
+        {
+            if (!_peerPackWindows.TryGetValue(peerId, out var window))
+            {
+                window = new NebulaPackWindow();
+                _peerPackWindows[peerId] = window;
+            }
+            window.Record(CurrentTick, payload);
+        }
+
+
+        /// <summary>
+        /// Drops NebulaPack state for a peer. Called on disconnect, and on world migration where
+        /// node ids are reassigned — a payload from the previous world would decode into the wrong
+        /// nodes entirely.
+        /// </summary>
+        private void ResetPackState(UUID peerId)
+        {
+            if (_peerPackWindows.TryGetValue(peerId, out var window)) window.Reset();
+        }
 
         /// <summary>
         /// Server-side: the last tick this peer acknowledged receiving, or -1 if none yet.
@@ -2484,6 +2640,11 @@ namespace Nebula
             // Update last ack tick for timeout tracking
             _peerLastAckTick[peerId] = tick;
 
+            // Mark this exact tick as received, so NebulaPack may use it as a delta baseline.
+            // Per-tick on purpose: acks are lossy too, so "everything below the newest ack" is not
+            // a safe assumption (see NebulaPackWindow.MarkAcked).
+            if (_peerPackWindows.TryGetValue(peerId, out var packWindow)) packWindow.MarkAcked(tick);
+
             var isFirstAck = peerState.Status == PeerSyncStatus.INITIAL;
             if (isFirstAck)
             {
@@ -2531,6 +2692,28 @@ namespace Nebula
             }
         }
 
+        /// <summary>
+        /// Client-side. Turns a received tick body back into the raw payload ImportState expects.
+        /// Returns false if the packet can't be trusted, in which case the caller must neither
+        /// apply nor acknowledge the tick — that is what makes the server fall back to raw.
+        /// </summary>
+        private bool TryUnpackTickPayload(Tick tick, byte[] wire, out NetBuffer payload)
+        {
+            _clientPackBuffer ??= new NetBuffer(NetRunner.MTU + 64, usePool: true);
+
+            var result = NebulaPack.ReadPacket(wire, tick, _clientPackWindow, _clientPackBuffer);
+            if (result != PackResult.Ok)
+            {
+                payload = null;
+                Log(Debugger.DebugLevel.ERROR, $"[Nebula][Pack] tick {tick} rejected: {result}");
+                return false;
+            }
+
+            payload = _clientPackBuffer;
+            return true;
+        }
+
+
         public void ClientProcessTick(int incomingTick, byte[] stateBytes)
         {
             // Skip old/duplicate ticks
@@ -2545,14 +2728,41 @@ namespace Nebula
                 InitializeClientPrediction(incomingTick);
             }
 
+            // Confirmed-timeline stall diagnostic. Distinguishes "server/network stalled"
+            // (this fires, repeatedly if it keeps happening) from "old debt the slew is
+            // still shedding" (this stays quiet). TimeSinceLastTick is wall-clock seconds
+            // since the previous confirmed tick arrived; read before OnWorldTickReceived
+            // resets it below.
+            float stallThreshold = 4f / NetRunner.TPS;
+            if (_predictionInitialized && TimeSinceLastTick > stallThreshold)
+            {
+                ulong nowMsec = Time.GetTicksMsec();
+                if (nowMsec - _lastStallLogMsec >= 1000)
+                {
+                    _lastStallLogMsec = nowMsec;
+                    Log(Debugger.DebugLevel.WARN,
+                        $"[Prediction] Confirmed timeline stalled for {TimeSinceLastTick * 1000f:F0}ms " +
+                        $"(tick jump {CurrentTick} -> {incomingTick}); prediction lead grew by ~{incomingTick - CurrentTick - 1} ticks");
+                }
+            }
+
             CurrentTick = incomingTick;
             OnWorldTickReceived(incomingTick); // Reset time accumulator for snapshot interpolation
             bool importSucceeded = false;
             try
             {
                 // Log(Debugger.DebugLevel.VERBOSE, $"Importing state bytes of size {stateBytes.Length}");
-                using var stateBuffer = new NetBuffer(stateBytes);
-                importSucceeded = ImportState(stateBuffer);
+                if (TryUnpackTickPayload(incomingTick, stateBytes, out var stateBuffer))
+                {
+                    importSucceeded = ImportState(stateBuffer);
+
+                    // Only an applied-and-acked payload may serve as a future baseline, so this is
+                    // gated on exactly the same condition as the ack below.
+                    if (importSucceeded)
+                    {
+                        _clientPackWindow.Record(incomingTick, stateBuffer.WrittenSpan);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -2654,10 +2864,15 @@ namespace Nebula
             // eventually drop this peer, which is the correct outcome for a broken stream.
             if (importSucceeded)
             {
-                _ackBuffer ??= new NetBuffer();
-                _ackBuffer.Reset();
-                NetWriter.WriteInt32(_ackBuffer, incomingTick);
-                NetRunner.SendUnreliableSequenced(NetRunner.Instance.ServerPeer, (byte)NetRunner.ENetChannelId.Tick, _ackBuffer);
+                // Don't send yet - hand it to the next outgoing input packet if there is one, so we
+                // pay ~4 bytes inside a packet we're already sending instead of a whole 44-byte
+                // datagram (a 4-byte payload in 40 bytes of IPv4 + UDP + ENet framing).
+                //
+                // If an ack is already waiting, this frame received two state packets. Flush the
+                // older one standalone rather than overwriting it: the server marks baselines
+                // per-tick, so dropping one would cost NebulaPack a baseline it could have used.
+                if (_pendingAckTick >= 0) SendStandaloneAck(_pendingAckTick);
+                _pendingAckTick = incomingTick;
             }
         }
 
@@ -2685,6 +2900,61 @@ namespace Nebula
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Input packet flags. The packet carries the client's tick acknowledgement when
+        /// <see cref="InputFlagHasAck"/> is set, so a 4-byte ack rides inside a packet already
+        /// being sent rather than costing its own 44-byte datagram.
+        ///
+        /// Layout:
+        /// <code>
+        ///   [flags u8][ackTick i32 if HasAck][netId u16][staticChildId u8]
+        ///   [inputSize u16][count u8][baseTick i32]  then count x [tickDelta u8][payload]
+        /// </code>
+        /// </summary>
+        private const byte InputFlagHasAck = 0x01;
+        private const byte InputFlagMask = InputFlagHasAck;
+
+        /// <summary>
+        /// Writes the redundant-input section: <c>[count u8][baseTick i32]</c> then one
+        /// <c>[tickDelta u8][payload]</c> per record. Returns how many records were written.
+        ///
+        /// <paramref name="records"/> comes from GetRecentInputs, which is newest-first and may
+        /// skip gaps in the input ring, so a tick can fall further back than a single byte can
+        /// express. Everything after the newest record is pure redundancy, so the tail is simply
+        /// dropped when that happens rather than falling back to wider ticks.
+        ///
+        /// The count is backfilled because how many records fit isn't known until the deltas have
+        /// been walked.
+        /// </summary>
+        internal static byte WriteInputRecords(NetBuffer buffer, List<(Tick, byte[])> records, int inputSize)
+        {
+            Tick baseTick = records.Count > 0 ? records[0].Item1 : 0;
+
+            int countPos = buffer.WritePosition;
+            NetWriter.WriteByte(buffer, 0);
+            NetWriter.WriteInt32(buffer, baseTick);
+
+            byte written = 0;
+            for (int i = 0; i < records.Count; i++)
+            {
+                var (tick, input) = records[i];
+                long delta = (long)baseTick - tick;
+
+                if (delta < 0 || delta > byte.MaxValue) break;
+                if (input == null || input.Length != inputSize) break;  // size is sent once; must agree
+
+                NetWriter.WriteByte(buffer, (byte)delta);
+                NetWriter.WriteBytes(buffer, input);
+                written++;
+            }
+
+            int endPos = buffer.WritePosition;
+            buffer.WritePosition = countPos;
+            NetWriter.WriteByte(buffer, written);
+            buffer.WritePosition = endPos;
+            return written;
         }
 
         internal void SendInput(NetworkController netNode)
@@ -2719,6 +2989,17 @@ namespace Nebula
             // Get pooled buffer to avoid allocation
             var inputBuffer = netNode.GetPooledInputBuffer();
 
+            // Carry the pending tick ack if nothing else has this frame. Only the first input
+            // packet takes it - SendInput runs once per owned node, and the ack is per-peer.
+            bool carriesAck = _pendingAckTick >= 0 && !_ackAttachedThisFrame;
+            NetWriter.WriteByte(inputBuffer, carriesAck ? InputFlagHasAck : (byte)0);
+            if (carriesAck)
+            {
+                NetWriter.WriteInt32(inputBuffer, _pendingAckTick);
+                _pendingAckTick = -1;
+                _ackAttachedThisFrame = true;
+            }
+
             // Static children don't have their own NetId - use parent's NetId + StaticChildId
             bool isStaticChild = netNode.StaticChildId > 0 && netNode.NetParent != null;
             if (isStaticChild)
@@ -2735,16 +3016,11 @@ namespace Nebula
             // Get recent inputs for redundancy
             var recentInputs = netNode.GetRecentInputs(NetworkController.INPUT_REDUNDANCY_COUNT);
 
-            // Write input count and all recent inputs
-            NetWriter.WriteByte(inputBuffer, (byte)recentInputs.Count);
+            // Every record has the same length (the input struct is fixed size per node), so send it
+            // once rather than repeating a 4-byte length on all 8 redundant copies.
+            NetWriter.WriteUInt16(inputBuffer, (ushort)inputBytes.Length);
 
-            for (int i = 0; i < recentInputs.Count; i++)
-            {
-                var (tick, input) = recentInputs[i];
-                NetWriter.WriteInt32(inputBuffer, tick);
-                NetWriter.WriteInt32(inputBuffer, input.Length);
-                NetWriter.WriteBytes(inputBuffer, input);
-            }
+            WriteInputRecords(inputBuffer, recentInputs, inputBytes.Length);
 
             // Send unreliable - input redundancy handles packet loss
             NetRunner.SendUnreliable(NetRunner.Instance.ServerPeer, (byte)NetRunner.ENetChannelId.Input, inputBuffer);
@@ -2754,6 +3030,20 @@ namespace Nebula
         internal void ReceiveInput(NetPeer peer, NetBuffer buffer)
         {
             if (NetRunner.Instance.IsClient) return;
+
+            // Read the ack FIRST. Every guard below returns early, and an acknowledgement must not
+            // be lost just because the input half of the packet was rejected - acks drive the
+            // INITIAL -> IN_WORLD transition, NebulaPack's baselines, and property resend clearing.
+            var inputFlags = NetReader.ReadByte(buffer);
+            if ((inputFlags & ~InputFlagMask) != 0)
+            {
+                Log(Debugger.DebugLevel.ERROR, $"[Nebula][InvalidInput] Unknown input flag bits 0x{inputFlags:X2} from peer {peer.ID}");
+                return;
+            }
+            if ((inputFlags & InputFlagHasAck) != 0)
+            {
+                PeerAcknowledge(peer, NetReader.ReadInt32(buffer));
+            }
 
             var networkId = NetReader.ReadUInt16(buffer);
             var staticChildId = NetReader.ReadByte(buffer);
@@ -2795,14 +3085,28 @@ namespace Nebula
                 return;
             }
 
+            // Input size is sent once for the whole packet - every redundant record is the same
+            // fixed-size input struct. Validate it against what this node actually expects: the
+            // size now drives every subsequent read, so a wrong value would misalign the rest of
+            // the packet rather than just producing one bad record.
+            var inputSize = NetReader.ReadUInt16(buffer);
+            var expectedSize = node.GetInputBytes().Length;
+            if (inputSize != expectedSize)
+            {
+                Log(Debugger.DebugLevel.ERROR, $"[Nebula][InvalidInput] Input size {inputSize} for node {worldNetId} (staticChild={staticChildId}) does not match the expected {expectedSize}");
+                return;
+            }
+
             // Read input count (redundancy - multiple inputs per packet)
             var inputCount = NetReader.ReadByte(buffer);
+
+            // Ticks are sent as one-byte offsets back from the newest.
+            var baseTick = NetReader.ReadInt32(buffer);
 
             // Read each tick-tagged input and buffer it
             for (int i = 0; i < inputCount; i++)
             {
-                var tick = NetReader.ReadInt32(buffer);
-                var inputSize = NetReader.ReadInt32(buffer);
+                var tick = baseTick - NetReader.ReadByte(buffer);
                 var inputBytes = NetReader.ReadBytes(buffer, inputSize);
 
                 // Clients run ahead of the server, so input ticks are legitimately in the future,
@@ -2826,7 +3130,7 @@ namespace Nebula
                 }
             }
 
-            Debug.Send("Input", $"Received {inputCount} inputs for node {worldNetId} (staticChild={staticChildId})");
+            // Debug.Send("Input", $"Received {inputCount} inputs for node {worldNetId} (staticChild={staticChildId})");
         }
 
         // WARNING: These are not exactly tick-aligned for state reconcilliation. Could cause state issues because the assumed tick is when it is received?
@@ -2885,8 +3189,11 @@ namespace Nebula
             NetWriter.WriteByte(buffer, functionInfo.Index);
             for (int i = 0; i < args.Length; i++)
             {
-                // Use protocol metadata directly, no Variant conversion
-                NetWriter.WriteByType(buffer, functionInfo.Arguments[i].VariantType, args[i]);
+                // Use protocol metadata directly, no Variant conversion. The subtype is not optional:
+                // ReceiveNetFunction reads each argument at the width the subtype implies, so
+                // omitting it here misaligns every argument after the first.
+                var argInfo = functionInfo.Arguments[i];
+                NetWriter.WriteByType(buffer, argInfo.VariantType, args[i], argInfo.Metadata.TypeIdentifier);
             }
             NetRunner.SendReliable(peer, (byte)NetRunner.ENetChannelId.Function, buffer);
         }

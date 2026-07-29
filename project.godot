@@ -10,9 +10,8 @@ config_version=5
 
 [Nebula]
 
-world/default_scene="uid://ck5p7purmvbqv"
-config/log_level=4
-config/default_scene="uid://ck5p7purmvbqv"
+config/world/default_scene="uid://ck5p7purmvbqv"
+config/debug/log_level=4
 
 [application]
 
