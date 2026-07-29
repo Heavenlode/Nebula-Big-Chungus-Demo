@@ -118,6 +118,17 @@ public partial class ProjectSettingsController : Node
             {"hint_string", "100,65535,1"},
         });
 
+        // Network tick rate in ticks per second. The network tick fires on whole physics
+        // frames, so this should divide physics/common/physics_ticks_per_second evenly
+        // (with 60 physics: 60, 30, 20, 15, 12, 10, ...); anything else snaps to the
+        // nearest achievable rate with a startup warning naming it. Read once at startup,
+        // so changes take effect on the next run.
+        Register("Nebula/config/network/ticks_per_second", 30, new(){
+            {"type", (int)Variant.Type.Int},
+            {"hint", (int)PropertyHint.Range},
+            {"hint_string", "1,120,1"},
+        });
+
         // ── World ────────────────────────────────────────────────────────
         // Default world scene
         var defaultScene = ProjectSettings.GetSetting("application/run/main_scene", "");
@@ -128,6 +139,14 @@ public partial class ProjectSettingsController : Node
         });
 
         // ── Debug ────────────────────────────────────────────────────────
+        // Master switch for the debug channel. On by default, but it never opens a
+        // port on its own: it is ANDed with --debugPort=N, which the editor's Play
+        // button supplies. Turning it off makes NetRunner/WorldRunner skip the
+        // broadcast path entirely rather than merely muting it.
+        Register(NetRunner.DEBUG_SERVER_SETTING, true, new(){
+            {"type", (int)Variant.Type.Bool},
+        });
+
         // Log level
         Register("Nebula/config/debug/log_level", 0, new(){
             {"type", (int)Variant.Type.Int},
@@ -147,6 +166,15 @@ public partial class ProjectSettingsController : Node
         // Debug: log the full hex of every server tick payload on the client
         Register("Nebula/config/debug/log_tick_payloads", false, new(){
             {"type", (int)Variant.Type.Bool},
+        });
+
+        // Debug: percentage of received tick packets the client drops before processing.
+        // Simulates an unreliable link on a lossless LAN, to exercise loss-recovery paths
+        // (spawn resend-until-acked, delta baseline fallback). 0 = off.
+        Register("Nebula/config/debug/simulate_incoming_tick_loss", 0, new(){
+            {"type", (int)Variant.Type.Int},
+            {"hint", (int)PropertyHint.Range},
+            {"hint_string", "0,100,1"},
         });
 
         // ── Pack ─────────────────────────────────────────────────────────

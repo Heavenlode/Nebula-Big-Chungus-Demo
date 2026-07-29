@@ -48,11 +48,6 @@ namespace Nebula
         }
 
         /// <summary>
-        /// The port for the debug server to listen on.
-        /// </summary>
-        public const int DebugPort = 59910;
-
-        /// <summary>
         /// The maximum number of allowed connections before the server starts rejecting clients.
         /// </summary>
         [Export] public int MaxPeers = 100;
@@ -216,17 +211,37 @@ namespace Nebula
         public DebugHub DebugHub { get; private set; }
 
         /// <summary>
-        /// Opt-in via <c>--debugPort=N</c> only, and deliberately so: a
-        /// dedicated server must not expose an unauthenticated debug port
-        /// because of a setting someone left switched on. The editor's Play
-        /// button assigns one per launched instance and the integration harness
-        /// passes it explicitly; the port is used verbatim, never fallen back.
+        /// The debug server project setting (<c>Nebula/config/debug/enable_debug_server</c>),
+        /// default on. This is a master OFF switch, ANDed with <c>--debugPort=N</c>
+        /// rather than replacing it: leaving it on never opens a port by itself, so a
+        /// dedicated server still exposes nothing unless it was explicitly launched
+        /// with a debug port. Turning it off makes the whole channel inert — no
+        /// listener, no frames built, no per-tick work anywhere.
+        ///
+        /// Cached on first read, so toggling it takes effect on the next run.
+        /// </summary>
+        public static bool DebugServerEnabled =>
+            _debugServerEnabled ??= ProjectSettings.GetSetting(DEBUG_SERVER_SETTING, true).AsBool();
+
+        private static bool? _debugServerEnabled;
+
+        /// <summary>Project setting key for <see cref="DebugServerEnabled"/>.</summary>
+        public const string DEBUG_SERVER_SETTING = "Nebula/config/debug/enable_debug_server";
+
+        /// <summary>
+        /// Opt-in via <c>--debugPort=N</c>, and gated by
+        /// <see cref="DebugServerEnabled"/>. The editor's Play button assigns a port
+        /// per launched instance and the integration harness passes it explicitly;
+        /// the port is used verbatim, never fallen back.
         ///
         /// Parsed here rather than in WorldRunner, where it used to live: that
         /// ran once per world, so multiple worlds fought over the same port.
         /// </summary>
         private void StartDebugHub()
         {
+            if (!DebugServerEnabled)
+                return;
+
             int explicitPort = 0;
             foreach (var argument in OS.GetCmdlineArgs())
             {
@@ -339,12 +354,47 @@ namespace Nebula
         }
 
         /// <summary>
-        /// This determines how fast the network sends data. When physics runs at 60 ticks per second, then at 2 PhysicsTicksPerNetworkTick, the network runs at 30hz.
+        /// How many physics ticks elapse per network tick. Derived from the
+        /// <c>Nebula/config/network/ticks_per_second</c> project setting (default 30): the
+        /// network tick fires on whole physics frames, so the divisor is the physics rate
+        /// over the requested rate, rounded to the nearest whole frame count. When the
+        /// requested rate does not divide the physics rate evenly, the nearest achievable
+        /// rate is used and a warning names it.
+        ///
+        /// Server and client must agree; both read the same project.godot, so this holds as
+        /// long as builds ship the same settings. Cached on first read - checked every
+        /// physics frame in WorldRunner, so it must not hit ProjectSettings per frame -
+        /// meaning changes take effect on the next run.
         /// </summary>
-        public const int PhysicsTicksPerNetworkTick = 2;
+        private static int? _physicsTicksPerNetworkTick;
+        public static int PhysicsTicksPerNetworkTick
+        {
+            get
+            {
+                if (_physicsTicksPerNetworkTick == null)
+                {
+                    int physicsRate = Engine.PhysicsTicksPerSecond;
+                    int requested = Math.Max(1,
+                        ProjectSettings.GetSetting("Nebula/config/network/ticks_per_second", 30).AsInt32());
+                    int divisor = Math.Max(1, (int)Math.Round(physicsRate / (double)requested));
+                    int actual = physicsRate / divisor;
+                    if (actual != requested)
+                    {
+                        Debugger.Instance?.Log(
+                            $"Nebula/config/network/ticks_per_second={requested} does not divide the physics rate ({physicsRate}); running at {actual} TPS (one network tick every {divisor} physics ticks).",
+                            Debugger.DebugLevel.WARN);
+                    }
+                    _physicsTicksPerNetworkTick = divisor;
+                }
+                return _physicsTicksPerNetworkTick.Value;
+            }
+        }
 
         /// <summary>
-        /// Ticks Per Second. The number of Ticks which are expected to elapse every second.
+        /// Ticks Per Second: the ACHIEVED network tick rate - engine physics rate divided by
+        /// <see cref="PhysicsTicksPerNetworkTick"/>. Equals the configured
+        /// <c>Nebula/config/network/ticks_per_second</c> whenever that divides the physics
+        /// rate evenly.
         /// </summary>
         private static int? _tps;
         public static int TPS
@@ -381,6 +431,21 @@ namespace Nebula
 
         public static bool LogTickPayloads =>
             _logTickPayloads ??= ProjectSettings.GetSetting("Nebula/config/debug/log_tick_payloads", false).AsBool();
+
+        private static int? _simulateIncomingTickLoss;
+        /// <summary>
+        /// Debug: percentage (0-100) of received tick packets the CLIENT drops before
+        /// processing, via <c>Nebula/config/debug/simulate_incoming_tick_loss</c>. Simulates
+        /// an unreliable link on a lossless LAN so loss-recovery paths (spawn resend-until-
+        /// acked, delta baseline fallback) can be exercised deterministically. Client-side
+        /// only; 0 (default) is a no-op. Cached on first read.
+        /// </summary>
+        public static int SimulateIncomingTickLoss =>
+            _simulateIncomingTickLoss ??= Math.Clamp(
+                ProjectSettings.GetSetting("Nebula/config/debug/simulate_incoming_tick_loss", 0).AsInt32(), 0, 100);
+
+        /// <summary>RNG for <see cref="SimulateIncomingTickLoss"/>. Debug-only, client-local.</summary>
+        private static readonly RandomNumberGenerator _tickLossRng = new();
 
         private static bool? _packEnabled;
         /// <summary>
@@ -565,6 +630,15 @@ namespace Nebula
                                     {
                                         Debugger.Instance.Log(Debugger.DebugLevel.INFO,
                                             $"[Nebula][TickPayload] tick={tick} ({bytes.Length} bytes) {Convert.ToHexString(bytes)}");
+                                    }
+                                    // Debug: simulate packet loss by dropping received ticks before
+                                    // processing. Client-side only, never touches the shared sim -
+                                    // exists to exercise loss-recovery paths (spawn resend, delta
+                                    // baseline fallback) deterministically on a LAN with no real loss.
+                                    if (SimulateIncomingTickLoss > 0
+                                        && _tickLossRng.RandiRange(1, 100) <= SimulateIncomingTickLoss)
+                                    {
+                                        break;
                                     }
                                     WorldRunner.CurrentWorld.ClientProcessTick(tick, bytes);
                                 }

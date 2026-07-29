@@ -207,7 +207,7 @@ namespace Nebula
                 // Sized explicitly: NetBuffer throws on overflow rather than
                 // growing, and its 1536-byte default is not guaranteed to fit
                 // an arbitrary message.
-                using var buffer = new NetBuffer((category.Length + message.Length) * 4 + 32, usePool: false);
+                using var buffer = new NetBuffer((category.Length + message.Length) * 4 + 32, usePool: true);
                 NetWriter.WriteString(buffer, category);
                 NetWriter.WriteString(buffer, message);
 
@@ -331,6 +331,23 @@ namespace Nebula
         private int _debugExportCounter;
 
         /// <summary>
+        /// Cycle-guard set for the world-state export, reused between exports.
+        /// </summary>
+        private readonly HashSet<Node> _debugVisited = new();
+
+        /// <summary>
+        /// Writes an id's raw 16 bytes into a debug payload.
+        /// <see cref="UUID.ToByteArray"/> would allocate an array per call — once
+        /// per peer per emit on these paths — so the debug channel writes through
+        /// the span instead.
+        /// </summary>
+        private static void WriteIdBytes(NetBuffer buffer, in UUID id)
+        {
+            id.TryWriteBytes(buffer.GetWriteSpan(DebugFrame.WorldIdSize));
+            buffer.AdvanceWrite(DebugFrame.WorldIdSize);
+        }
+
+        /// <summary>
         /// Full world state for the debugger's node tree and property
         /// inspector. Reuses the persistence serializer
         /// (<c>NetNodeCommon.ToBSONDocument</c>) rather than a bespoke walk, so
@@ -358,10 +375,13 @@ namespace Nebula
                 // Visited set guards against reference cycles: a NetNode-typed
                 // [NetProperty] pointing back at an ancestor would otherwise
                 // recurse until the stack blows, taking the process with it.
+                // Reused across exports (cleared, not reallocated) so the guard
+                // itself doesn't become the thing that churns the heap.
+                _debugVisited.Clear();
                 var state = root.BsonSerialize(new NetBsonContext
                 {
                     Recurse = true,
-                    Visited = new HashSet<Node>(),
+                    Visited = _debugVisited,
                 });
                 json = state.ToJson(new MongoDB.Bson.IO.JsonWriterSettings
                 {
@@ -374,7 +394,7 @@ namespace Nebula
                 return;
             }
 
-            using var buffer = new NetBuffer(json.Length * 4 + 64, usePool: false);
+            using var buffer = new NetBuffer(json.Length * 4 + 64, usePool: true);
             NetWriter.WriteString(buffer, json);
             hub.Enqueue(WorldId, DebugDataType.EXPORT, buffer, lossy: true);
         }
@@ -394,7 +414,7 @@ namespace Nebula
             const int BytesPerPeer = 16 + 4 + 1 + 2;
             int count = Math.Min(PeerStates.Count, byte.MaxValue);
 
-            using var buffer = new NetBuffer(1 + count * BytesPerPeer + 16, usePool: false);
+            using var buffer = new NetBuffer(1 + count * BytesPerPeer + 16, usePool: true);
             NetWriter.WriteByte(buffer, (byte)count);
 
             int written = 0;
@@ -402,7 +422,7 @@ namespace Nebula
             {
                 if (written >= count)
                     break;
-                NetWriter.WriteBytes(buffer, peerState.Id.ToByteArray());
+                WriteIdBytes(buffer, peerState.Id);
                 NetWriter.WriteInt32(buffer, peerState.Tick);
                 NetWriter.WriteByte(buffer, (byte)peerState.Status);
                 NetWriter.WriteUInt16(buffer, (ushort)Math.Min(peerState.OwnedNodes?.Count ?? 0, ushort.MaxValue));
@@ -1330,7 +1350,7 @@ namespace Nebula
             {
                 // Notify the Debugger of the incoming tick. Reliable: the editor
                 // keys every other frame off the tick that opened it.
-                using var debugBuffer = new NetBuffer(16, usePool: false);
+                using var debugBuffer = new NetBuffer(16, usePool: true);
                 NetWriter.WriteInt64(debugBuffer, DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond);
                 NetWriter.WriteInt32(debugBuffer, CurrentTick);
                 debugHub.Enqueue(WorldId, DebugDataType.TICK, debugBuffer, lossy: false);
@@ -1361,7 +1381,7 @@ namespace Nebula
                 if (debugAttached)
                 {
                     // Notify the Debugger of the function call
-                    using var debugBuffer = new NetBuffer(NetRunner.MTU + 64, usePool: false);
+                    using var debugBuffer = new NetBuffer(NetRunner.MTU + 64, usePool: true);
                     NetWriter.WriteString(debugBuffer, queuedFunction.FunctionInfo.Name);
                     NetWriter.WriteByte(debugBuffer, (byte)queuedFunction.Args.Length);
                     for (int i = 0; i < queuedFunction.Args.Length; i++)
@@ -1379,7 +1399,7 @@ namespace Nebula
             {
                 foreach (var log in tickLogBuffer)
                 {
-                    using var logBuffer = new NetBuffer(log.Message.Length * 4 + 32, usePool: false);
+                    using var logBuffer = new NetBuffer(log.Message.Length * 4 + 32, usePool: true);
                     NetWriter.WriteByte(logBuffer, (byte)log.Level);
                     NetWriter.WriteString(logBuffer, log.Message);
                     debugHub.Enqueue(WorldId, DebugDataType.LOGS, logBuffer, lossy: false);
@@ -1446,8 +1466,8 @@ namespace Nebula
                             // default: that default only cleared the old header
                             // by ~119 bytes at the stock MTU, so any project
                             // raising Nebula/config/mtu made this throw.
-                            using var debugBuffer = new NetBuffer(16 + 4 + peerStateBuffer.Length + 16, usePool: false);
-                            NetWriter.WriteBytes(debugBuffer, peerState.Id.ToByteArray());
+                            using var debugBuffer = new NetBuffer(16 + 4 + peerStateBuffer.Length + 16, usePool: true);
+                            WriteIdBytes(debugBuffer, peerState.Id);
                             // The size actually put on the wire for this peer, which is
                             // what the debugger charts against the MTU. The state bytes
                             // that follow are the pre-pack payload kept for inspection,
@@ -1903,6 +1923,12 @@ namespace Nebula
             // into entirely the wrong nodes. The destination world also restarts near tick 0, which
             // would otherwise collide with retained ring slots.
             _clientPackWindow.Reset();
+
+            // A parked ack still references an old-world tick. Acks are routed by peer, not by
+            // world, so flushing it after the migration would land it in the destination world's
+            // PeerAcknowledge - and if the tick number happens to be valid there, it marks state
+            // this client never applied as acked (delta baselines, spawn commits).
+            _pendingAckTick = -1;
             TimeSinceLastTick = 0f;
             _ownedEntities.Clear();
             _ownedEntitiesDirty = true;
@@ -2493,6 +2519,13 @@ namespace Nebula
         /// </summary>
         internal bool ImportState(NetBuffer stateBytes)
         {
+            // Set when any serializer parses its payload but reports it was not applied
+            // (e.g. a props delta whose baseline this client doesn't have). The stream stays
+            // aligned - unlike the corrupted-buffer aborts below - but the tick must not be
+            // acked: an ack tells the server "I have this tick's data", and acking a
+            // discarded payload latches delta encoding onto a baseline we never recorded.
+            bool anyDiscarded = false;
+
             // Read hierarchical bitmask: groupMask (1 byte) + nodeMasks for active groups
             var groupMask = NetReader.ReadByte(stateBytes);
             var nodeMasks = new long[NodeIdUtils.NODE_GROUPS];
@@ -2553,19 +2586,28 @@ namespace Nebula
                             // Log($"[ImportState] Node {localNodeId}: Skipping serializer {serializerIdx} (bit not set)");
                             continue;
                         }
-                        
-                        // Skip if node was queued for despawn during import (e.g., by SpawnSerializer handling despawn)
-                        if (netController.IsQueuedForDespawn || netController.IsMarkedForDeletion)
-                        {
-                            break;
-                        }
-                        
+
+                        // A node queued for despawn (mid-import by SpawnSerializer, or earlier by a
+                        // pending client despawn) still has its serializer bytes in this packet -
+                        // the mask bit proves the server wrote them. The serializers must still
+                        // run so those bytes are consumed; breaking out here would leave them in
+                        // the buffer and misalign every node after this one. Applying values to a
+                        // dying node is harmless: QueueDespawnedNodes is drained at the end of
+                        // this same ClientProcessTick and the free is deferred, so the node is
+                        // alive for the duration of the import. We just don't let a discard from
+                        // a doomed node veto the tick ack.
+                        bool nodeIsDoomed = netController.IsQueuedForDespawn || netController.IsMarkedForDeletion;
+
                         var serializerInstance = netController.NetNode.Serializers[serializerIdx];
                         // Log($"[ImportState] Node {localNodeId}: Running serializer {serializerIdx} ({serializerInstance.GetType().Name})");
 
                         try
                         {
-                            serializerInstance.Import(this, stateBytes, out NetworkController nodeOut);
+                            bool applied = serializerInstance.Import(this, stateBytes, out NetworkController nodeOut);
+                            if (!applied && !nodeIsDoomed)
+                            {
+                                anyDiscarded = true;
+                            }
                             if (netController != nodeOut)
                             {
                                 // Log($"[ImportState] Node {localNodeId}: Serializer {serializerIdx} replaced node, new scenePath='{nodeOut.NetSceneFilePath}', restarting loop");
@@ -2606,7 +2648,7 @@ namespace Nebula
                 }
             }
 
-            return true;
+            return !anyDiscarded;
         }
 
         // Reusable list for objects that had all data acked (avoids modifying HashSet during iteration)
