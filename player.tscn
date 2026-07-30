@@ -29,7 +29,5 @@ _player = NodePath("..")
 script = ExtResource("3_i3pqv")
 SourceNode = NodePath("../Controller")
 TargetNode = NodePath("../Model")
-VisualInterpolateSpeed = 10.0
-InterpolationMode = 1
 NetPositionPredictionTolerance = 0.5
 metadata/_custom_type_script = "uid://b2eyg65ebknbg"
